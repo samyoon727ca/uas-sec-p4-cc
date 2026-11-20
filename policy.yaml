@@ -1,0 +1,72 @@
+# CC proxy policy (SR-011 allowlist, SR-012 rate limits) for GCS -> FC MAVLink traffic.
+#
+# STATUS: PROPOSED -- OWNER TO APPROVE.
+# P1 (uas-sec-p1-architecture docs/07-requirements.md) fixes only the six SR-011
+# exclusions below. The allowed_messages / allowed_commands lists and every rate
+# in this file are draft values proposed by this repo and are NOT yet approved
+# by the owner. Do not treat them as a verified baseline until `status` is
+# changed to `approved`.
+#
+# All names are resolved against pymavlink's MAVLink "common" dialect; an
+# unknown name is a load error, never silently ignored.
+
+status: proposed
+
+# SR-011: always dropped, even if also listed in allowed_messages.
+excluded_messages:
+  - SERIAL_CONTROL
+  - FILE_TRANSFER_PROTOCOL
+  - SETUP_SIGNING
+  - RADIO_STATUS
+  - ADSB_VEHICLE
+  - COLLISION
+
+# Draft message allowlist (GCS -> FC). Anything not listed is dropped.
+allowed_messages:
+  - HEARTBEAT
+  - COMMAND_LONG
+  - COMMAND_INT
+  - PARAM_REQUEST_LIST
+  - PARAM_REQUEST_READ
+  - PARAM_SET
+  - MISSION_COUNT
+  - MISSION_ITEM_INT
+  - MISSION_REQUEST_INT
+  - MISSION_REQUEST_LIST
+  - MISSION_ACK
+  - MISSION_CLEAR_ALL
+  - MISSION_SET_CURRENT
+  - SET_MODE
+  - MANUAL_CONTROL
+  - SYSTEM_TIME
+  - TIMESYNC
+  - PING
+
+# Draft MAV_CMD allowlist applied to COMMAND_LONG / COMMAND_INT.
+# Deliberately absent: MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, MAV_CMD_PREFLIGHT_STORAGE,
+# MAV_CMD_DO_FLIGHTTERMINATION and other maintenance/destructive commands.
+allowed_commands:
+  - MAV_CMD_REQUEST_MESSAGE
+  - MAV_CMD_SET_MESSAGE_INTERVAL
+  - MAV_CMD_COMPONENT_ARM_DISARM
+  - MAV_CMD_DO_SET_MODE
+  - MAV_CMD_NAV_TAKEOFF
+  - MAV_CMD_NAV_LAND
+  - MAV_CMD_NAV_RETURN_TO_LAUNCH
+  - MAV_CMD_NAV_LOITER_UNLIM
+  - MAV_CMD_MISSION_START
+  - MAV_CMD_DO_REPOSITION
+  - MAV_CMD_DO_CHANGE_SPEED
+
+# Draft SR-012 token-bucket limits per message type: `rate` in msgs/s,
+# `burst` = bucket size in msgs. `default` applies to any allowed message
+# without its own entry. (Enforcement lands in a later PR.)
+rates:
+  default: {rate: 10, burst: 20}
+  HEARTBEAT: {rate: 2, burst: 4}
+  MANUAL_CONTROL: {rate: 50, burst: 50}
+  COMMAND_LONG: {rate: 5, burst: 10}
+  COMMAND_INT: {rate: 5, burst: 10}
+  PARAM_SET: {rate: 5, burst: 10}
+  PARAM_REQUEST_LIST: {rate: 0.2, burst: 1}
+  MISSION_ITEM_INT: {rate: 20, burst: 50}
