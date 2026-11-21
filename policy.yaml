@@ -1,11 +1,11 @@
-# CC proxy policy (SR-011 allowlist, SR-012 rate limits) for GCS -> FC MAVLink traffic.
+# CC proxy policy (SR-011 allowlist, SR-012 rate limits, peer map) for GCS -> FC MAVLink traffic.
 #
 # STATUS: PROPOSED -- OWNER TO APPROVE.
 # P1 (uas-sec-p1-architecture docs/07-requirements.md) fixes only the six SR-011
-# exclusions below. The allowed_messages / allowed_commands lists and every rate
-# in this file are draft values proposed by this repo and are NOT yet approved
-# by the owner. Do not treat them as a verified baseline until `status` is
-# changed to `approved`.
+# exclusions below. The allowed_messages / allowed_commands lists, every rate
+# and the peer map in this file are draft values proposed by this repo and are
+# NOT yet approved by the owner. Do not treat them as a verified baseline until
+# `status` is changed to `approved`.
 #
 # All names are resolved against pymavlink's MAVLink "common" dialect; an
 # unknown name is a load error, never silently ignored.
@@ -60,7 +60,8 @@ allowed_commands:
 
 # Draft SR-012 token-bucket limits per message type: `rate` in msgs/s,
 # `burst` = bucket size in msgs. `default` applies to any allowed message
-# without its own entry. (Enforcement lands in a later PR.)
+# without its own entry. Each (peer, message type) pair has its own bucket,
+# which starts full; a frame that finds it empty is dropped as `rate_limited`.
 rates:
   default: {rate: 10, burst: 20}
   HEARTBEAT: {rate: 2, burst: 4}
@@ -70,3 +71,20 @@ rates:
   PARAM_SET: {rate: 5, burst: 10}
   PARAM_REQUEST_LIST: {rate: 0.2, burst: 1}
   MISSION_ITEM_INT: {rate: 20, burst: 50}
+
+# Draft peer map: a frame's peer is looked up from its packet source IP.
+# ASSUMPTION: this mirrors WireGuard AllowedIPs. Each peer would reach the CC
+# over a WireGuard tunnel, and WireGuard's cryptokey routing only accepts an
+# inner source IP inside the sending peer's AllowedIPs, so the source IP is
+# bound to that peer's key. This slice runs without real tunnels, so the
+# binding is assumed, not enforced. Lookup is longest-prefix match (as in
+# WireGuard); a source no peer covers is dropped as `unknown_peer`.
+peers:
+  - name: gcs-primary
+    allowed_ips: [10.8.0.2/32]
+  # Loopback: processes on the CC itself. The tests also send from here.
+  - name: cc-local
+    allowed_ips: [127.0.0.1/32, "::1/128"]
+
+# Peer whose traffic is CC-originated; it is labelled as such in counters.
+local_peer: cc-local

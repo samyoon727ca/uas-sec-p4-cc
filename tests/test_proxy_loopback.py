@@ -4,13 +4,15 @@ import signal
 import socket
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import yaml
 from pymavlink.dialects.v20 import common as mav2
 
-from cc_proxy.policy import load_policy
-from cc_proxy.proxy import Proxy, split_frames
+from cc_proxy.policy import load_policy, parse_policy
+from cc_proxy.proxy import RATE_LIMITED, UNKNOWN_PEER, Proxy, split_frames
 
 POLICY_PATH = Path(__file__).resolve().parents[1] / "policy.yaml"
 RECV_TIMEOUT = 2.0
@@ -45,11 +47,12 @@ def udp_socket():
     return sock
 
 
-@pytest.fixture
-def rig():
+@contextmanager
+def make_rig(policy=None, **proxy_kwargs):
     fc = udp_socket()
     gcs = udp_socket()
-    proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), fc.getsockname())
+    policy = policy or load_policy(POLICY_PATH)
+    proxy = Proxy(policy, ("127.0.0.1", 0), fc.getsockname(), **proxy_kwargs)
     proxy.start()
     try:
         yield proxy, gcs, fc
@@ -58,6 +61,12 @@ def rig():
         gcs.close()
         fc.close()
     assert proxy.error is None
+
+
+@pytest.fixture
+def rig():
+    with make_rig() as r:
+        yield r
 
 
 def send_up(proxy, gcs, data):
@@ -146,6 +155,55 @@ def test_downlink_from_non_fc_source_ignored(rig):
     assert_silent(gcs)
     assert proxy.stats().downlink_ignored == 1
     assert proxy.stats().downlink_relayed == 0
+
+
+def test_allowed_frame_counted_for_local_peer(rig):
+    proxy, gcs, fc = rig
+    send_up(proxy, gcs, heartbeat())
+    fc.recvfrom(65535)
+    send_up(proxy, gcs, ftp())
+    assert_silent(fc)
+    stats = proxy.stats()
+    assert stats.peer_forwarded == {"cc-local": 1}
+    assert stats.peer_dropped == {
+        ("cc-local", "excluded message FILE_TRANSFER_PROTOCOL (SR-011)"): 1
+    }
+    assert stats.local_peer == "cc-local"
+    assert "cc-local (CC-originated): forwarded 1" in stats.format()
+
+
+def test_unknown_peer_dropped():
+    raw = yaml.safe_load(POLICY_PATH.read_text(encoding="utf-8"))
+    raw["peers"] = [{"name": "gcs-primary", "allowed_ips": ["10.8.0.2/32"]}]
+    del raw["local_peer"]
+    with make_rig(parse_policy(raw)) as (proxy, gcs, fc):
+        send_up(proxy, gcs, heartbeat() + ftp())
+        assert_silent(fc)
+        stats = proxy.stats()
+    assert stats.forwarded == {}
+    assert stats.dropped == {(HEARTBEAT_ID, UNKNOWN_PEER): 1, (FTP_ID, UNKNOWN_PEER): 1}
+    assert stats.peer_forwarded == {}
+    assert stats.peer_dropped == {}
+
+
+def test_over_rate_frames_dropped_as_rate_limited():
+    policy = load_policy(POLICY_PATH)
+    burst = policy.rate_for(HEARTBEAT_ID).burst
+    extra = 3
+    # Frozen clock: the bucket never refills, so exactly `burst` frames pass.
+    with make_rig(policy, clock=lambda: 0.0) as (proxy, gcs, fc):
+        frame = heartbeat()
+        for _ in range(burst + extra):
+            send_up(proxy, gcs, frame)
+        for _ in range(burst):
+            data, _ = fc.recvfrom(65535)
+            assert data == frame
+        assert_silent(fc)
+        stats = proxy.stats()
+    assert stats.forwarded == {HEARTBEAT_ID: burst}
+    assert stats.dropped == {(HEARTBEAT_ID, RATE_LIMITED): extra}
+    assert stats.peer_forwarded == {"cc-local": burst}
+    assert stats.peer_dropped == {("cc-local", RATE_LIMITED): extra}
 
 
 def test_split_frames_returns_views_of_datagram():

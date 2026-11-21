@@ -1,12 +1,18 @@
-"""Load and validate ``policy.yaml`` (SR-011 allowlist, SR-012 rates).
+"""Load and validate ``policy.yaml`` (SR-011 allowlist, SR-012 rates, peer map).
 
 Message and command names are resolved to numeric IDs against pymavlink's
 MAVLink ``common`` dialect. Any unknown name, unknown key or malformed value is
 a :class:`PolicyError`; nothing is silently ignored.
+
+Peers are identified by packet source IP through ``peers[].allowed_ips``, which
+mirrors WireGuard AllowedIPs (cryptokey routing binds an inner source IP to one
+peer key). A source is mapped to the peer with the longest matching prefix, as
+WireGuard does; the same prefix listed under two peers is a load error.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,8 +35,13 @@ _TOP_LEVEL_KEYS = {
     "allowed_messages",
     "allowed_commands",
     "rates",
+    "peers",
 }
+_OPTIONAL_KEYS = {"local_peer"}
 _RATE_KEYS = {"rate", "burst"}
+_PEER_KEYS = {"name", "allowed_ips"}
+
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
 class PolicyError(ValueError):
@@ -46,6 +57,19 @@ class Rate:
 
 
 @dataclass(frozen=True)
+class Peer:
+    """A peer and the source networks attributed to it (WireGuard AllowedIPs).
+
+    ``local`` marks the peer named by ``local_peer``: traffic originated on the
+    companion computer itself rather than received from a remote peer.
+    """
+
+    name: str
+    allowed_ips: tuple[IPNetwork, ...]
+    local: bool = False
+
+
+@dataclass(frozen=True)
 class Policy:
     status: str
     excluded_messages: frozenset[int]
@@ -53,9 +77,26 @@ class Policy:
     allowed_commands: frozenset[int]
     default_rate: Rate
     rates: Mapping[int, Rate]
+    peers: tuple[Peer, ...]
 
     def rate_for(self, msgid: int) -> Rate:
         return self.rates.get(msgid, self.default_rate)
+
+    def peer_for(self, host: str) -> Peer | None:
+        """The peer owning source address ``host`` (longest prefix), or ``None``."""
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped  # dual-stack socket: ::ffff:a.b.c.d is a.b.c.d
+        best: Peer | None = None
+        best_len = -1
+        for peer in self.peers:
+            for net in peer.allowed_ips:
+                if net.version == addr.version and addr in net and net.prefixlen > best_len:
+                    best, best_len = peer, net.prefixlen
+        return best
 
 
 def load_policy(path: str | Path) -> Policy:
@@ -76,7 +117,7 @@ def parse_policy(data: Any) -> Policy:
     """Validate an already-parsed policy mapping and resolve names to IDs."""
     if not isinstance(data, dict):
         raise PolicyError("policy must be a mapping")
-    unknown = set(data) - _TOP_LEVEL_KEYS
+    unknown = set(data) - _TOP_LEVEL_KEYS - _OPTIONAL_KEYS
     if unknown:
         raise PolicyError(f"unknown policy keys: {sorted(map(str, unknown))}")
     missing = _TOP_LEVEL_KEYS - set(data)
@@ -91,6 +132,7 @@ def parse_policy(data: Any) -> Policy:
     allowed = _resolve_names(data["allowed_messages"], MESSAGE_IDS, "allowed_messages")
     commands = _resolve_names(data["allowed_commands"], COMMAND_IDS, "allowed_commands")
     default_rate, rates = _parse_rates(data["rates"])
+    peers = _parse_peers(data["peers"], data.get("local_peer"))
 
     return Policy(
         status=status,
@@ -99,6 +141,7 @@ def parse_policy(data: Any) -> Policy:
         allowed_commands=commands,
         default_rate=default_rate,
         rates=rates,
+        peers=peers,
     )
 
 
@@ -153,3 +196,41 @@ def _parse_rate(spec: Any, where: str) -> Rate:
     if isinstance(burst, bool) or not isinstance(burst, int) or burst < 1:
         raise PolicyError(f"'{where}.burst' must be an integer >= 1, got {burst!r}")
     return Rate(rate=float(rate), burst=burst)
+
+
+def _parse_peers(value: Any, local_peer: Any) -> tuple[Peer, ...]:
+    if not isinstance(value, list) or not value:
+        raise PolicyError("'peers' must be a non-empty list")
+    if local_peer is not None and (not isinstance(local_peer, str) or not local_peer):
+        raise PolicyError(f"'local_peer' must be a peer name, got {local_peer!r}")
+    peers: list[Peer] = []
+    owner: dict[IPNetwork, str] = {}
+    for i, spec in enumerate(value):
+        where = f"peers[{i}]"
+        if not isinstance(spec, dict) or set(spec) != _PEER_KEYS:
+            raise PolicyError(f"'{where}' must be a mapping with exactly keys {sorted(_PEER_KEYS)}")
+        name, cidrs = spec["name"], spec["allowed_ips"]
+        if not isinstance(name, str) or not name:
+            raise PolicyError(f"'{where}.name' must be a non-empty string")
+        if any(p.name == name for p in peers):
+            raise PolicyError(f"'{where}': duplicate peer name {name!r}")
+        if not isinstance(cidrs, list) or not cidrs:
+            raise PolicyError(f"'{where}.allowed_ips' must be a non-empty list of CIDRs")
+        nets = []
+        for cidr in cidrs:
+            if not isinstance(cidr, str):
+                raise PolicyError(f"'{where}.allowed_ips': expected a CIDR, got {cidr!r}")
+            try:
+                net = ipaddress.ip_network(cidr, strict=True)
+            except ValueError as exc:
+                raise PolicyError(f"'{where}.allowed_ips': invalid CIDR {cidr!r}: {exc}") from None
+            if net in owner:
+                raise PolicyError(
+                    f"'{where}.allowed_ips': {net} already belongs to peer {owner[net]!r}"
+                )
+            owner[net] = name
+            nets.append(net)
+        peers.append(Peer(name=name, allowed_ips=tuple(nets), local=name == local_peer))
+    if local_peer is not None and not any(p.local for p in peers):
+        raise PolicyError(f"'local_peer': no peer named {local_peer!r}")
+    return tuple(peers)
