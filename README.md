@@ -106,12 +106,24 @@ line:
   plus a `reason` (`command N not in allowlist`, `rate_limited`, `unknown_peer`
   with `"peer": null`, `send error`). This records attempts as well as what
   reached the FC; filter on `action` for forwarded commands only.
+- **Drop lines are capped** at 10 per peer per second (every `unknown_peer`
+  source shares the `null` peer's budget). Further drops in that second are
+  only counted, then summarised in one line per peer when the second ends (or
+  the proxy stops):
+  `{"ts": ..., "action": "drop_suppressed", "peer": ..., "since": ..., "suppressed": K}`.
+  Without the cap, anyone who can reach the listen port could flood
+  `COMMAND_LONG` and fill the disk; with the fail-closed rule below, that
+  would stop the proxy and cut all C2. Forward lines are not capped: forwarded
+  commands are already held to the SR-012 rate. Exact drop counts are still in
+  the proxy counters.
 - A frame counts as a command only after it passed the structure, checksum and
   message-allowlist checks; frames dropped earlier are not logged (their fields
   cannot be trusted) and are only counted.
 - A forwarded command is logged right after it is sent. If the log cannot be
   written, the proxy loop stops (fail closed), so at most that one command is
-  forwarded without a log line. Rotation and shipping are out of scope.
+  forwarded without a log line. Disk use therefore has to stay bounded by
+  rate: forward lines by the SR-012 limits, drop lines by the cap above.
+  Rotation and shipping are out of scope.
 
 ## Development
 

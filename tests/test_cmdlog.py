@@ -11,8 +11,14 @@ import pytest
 import yaml
 from pymavlink.dialects.v20 import common as mav2
 
-from cc_proxy.classifier import Action, Decision
-from cc_proxy.cmdlog import CommandLog, command_entry, format_source, format_timestamp
+from cc_proxy.classifier import Action, Decision, classify
+from cc_proxy.cmdlog import (
+    DROP_LINES_PER_SECOND,
+    CommandLog,
+    command_entry,
+    format_source,
+    format_timestamp,
+)
 from cc_proxy.policy import load_policy, parse_policy
 from cc_proxy.proxy import RATE_LIMITED, UNKNOWN_PEER, Proxy
 
@@ -60,9 +66,9 @@ def udp_socket():
 
 
 @contextmanager
-def make_rig(log_path, policy=None, now=lambda: FIXED_NOW, **proxy_kwargs):
+def make_rig(log_path, policy=None, now=lambda: FIXED_NOW, log_kwargs=None, **proxy_kwargs):
     fc, gcs = udp_socket(), udp_socket()
-    with CommandLog(log_path, now=now) as command_log:
+    with CommandLog(log_path, now=now, **(log_kwargs or {})) as command_log:
         proxy = Proxy(policy or load_policy(POLICY_PATH), ("127.0.0.1", 0), fc.getsockname(),
                       command_log=command_log, **proxy_kwargs)
         proxy.start()
@@ -239,3 +245,92 @@ def test_log_appends_to_existing_file(tmp_path):
         entries = read_log(log_path, 2)
     assert entries[0] == {"earlier": True}
     assert entries[1]["action"] == "forward"
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def disallowed_decision():
+    frame = command_long(REBOOT)
+    return frame, classify(frame, load_policy(POLICY_PATH))
+
+
+def test_drop_lines_capped_per_peer_with_summary(tmp_path):
+    log_path = tmp_path / "cmd.jsonl"
+    clock = FakeClock()
+    frame, decision = disallowed_decision()
+    src = ("10.0.0.9", 5000)
+    with CommandLog(log_path, now=lambda: FIXED_NOW, clock=clock,
+                    drop_lines_per_second=2) as command_log:
+        for _ in range(5):
+            command_log.dropped(frame, src, "gcs-a", decision, "x")
+        command_log.dropped(frame, src, None, decision, UNKNOWN_PEER)  # own budget
+        clock.t = 0.99
+        command_log.tick()  # window still open: no summary yet
+        assert len(read_log(log_path, 3, timeout=0)) == 3
+        clock.t = 1.0
+        command_log.tick()
+        entries = read_log(log_path, 4, timeout=0)
+        clock.t = 1.5
+        command_log.dropped(frame, src, "gcs-a", decision, "x")  # new window
+        entries_after = read_log(log_path, 5, timeout=0)
+    assert [(e["action"], e["peer"]) for e in entries] == [
+        ("drop", "gcs-a"), ("drop", "gcs-a"), ("drop", None), ("drop_suppressed", "gcs-a"),
+    ]
+    assert entries[-1] == {
+        "ts": "2026-11-21T12:34:56.789012Z",
+        "action": "drop_suppressed",
+        "peer": "gcs-a",
+        "since": "2026-11-21T12:34:56.789012Z",
+        "suppressed": 3,
+    }
+    assert [(e["action"], e["peer"]) for e in entries_after[4:]] == [("drop", "gcs-a")]
+    # The new window had nothing suppressed, so closing adds no summary.
+    assert len(read_log(log_path, 5, timeout=0)) == 5
+
+
+def test_forward_lines_not_capped(tmp_path):
+    log_path = tmp_path / "cmd.jsonl"
+    frame = command_long()
+    decision = classify(frame, load_policy(POLICY_PATH))
+    with CommandLog(log_path, clock=FakeClock(), drop_lines_per_second=0) as command_log:
+        for _ in range(5):
+            command_log.forwarded(frame, ("127.0.0.1", 1), "cc-local", decision)
+        command_log.dropped(frame, ("127.0.0.1", 1), "cc-local", decision, "x")
+    entries = read_log(log_path, 6, timeout=0)
+    assert [e["action"] for e in entries] == ["forward"] * 5 + ["drop_suppressed"]
+    assert entries[-1]["suppressed"] == 1
+
+
+def test_unknown_peer_flood_bounded_through_proxy(tmp_path):
+    raw = yaml.safe_load(POLICY_PATH.read_text(encoding="utf-8"))
+    raw["peers"] = [{"name": "gcs-primary", "allowed_ips": ["10.8.0.2/32"]}]
+    del raw["local_peer"]
+    policy = parse_policy(raw)
+    flood = DROP_LINES_PER_SECOND * 3
+    log_path = tmp_path / "cmd.jsonl"
+    # Frozen log clock: the whole flood falls in one window.
+    with make_rig(log_path, policy, log_kwargs={"clock": lambda: 0.0}) as (proxy, gcs, fc):
+        for _ in range(flood):
+            gcs.sendto(command_long(), proxy.listen_address)
+        deadline = time.monotonic() + RECV_TIMEOUT
+        while (sum(proxy.stats().dropped.values()) < flood
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        assert sum(proxy.stats().dropped.values()) == flood
+    entries = read_log(log_path, DROP_LINES_PER_SECOND + 1, timeout=0)
+    assert [e["action"] for e in entries] == (
+        ["drop"] * DROP_LINES_PER_SECOND + ["drop_suppressed"]
+    )
+    assert entries[-1]["peer"] is None
+    assert entries[-1]["suppressed"] == flood - DROP_LINES_PER_SECOND
+
+
+def test_negative_drop_limit_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        CommandLog(tmp_path / "cmd.jsonl", drop_lines_per_second=-1)

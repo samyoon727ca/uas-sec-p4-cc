@@ -24,7 +24,9 @@ and ``peer_dropped[(peer, reason)]``. The ``local_peer`` from the policy is
 labelled CC-originated.
 
 COMMAND_LONG / COMMAND_INT frames are also written to the SR-013 command log
-(:class:`cc_proxy.cmdlog.CommandLog`), forwarded and dropped alike.
+(:class:`cc_proxy.cmdlog.CommandLog`), forwarded and dropped alike (drop
+lines are capped per peer; the proxy loop calls ``tick`` to write the
+suppressed-drop summaries).
 """
 
 from __future__ import annotations
@@ -252,6 +254,8 @@ class Proxy:
             while not self._stop_event.is_set():
                 for key, _ in sel.select(timeout=_SELECT_TIMEOUT):
                     key.data()
+                if self._command_log is not None:
+                    self._command_log.tick()
         except BaseException as exc:
             self.error = exc
             log.exception("proxy loop failed")

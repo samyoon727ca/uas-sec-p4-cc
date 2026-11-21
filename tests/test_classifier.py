@@ -6,7 +6,7 @@ import pytest
 from pymavlink.dialects.v10 import common as mav1
 from pymavlink.dialects.v20 import common as mav2
 
-from cc_proxy.classifier import _COMMAND_OFFSET, Action, classify
+from cc_proxy.classifier import _COMMAND_OFFSET, _TARGETS_DELTA, Action, classify
 from cc_proxy.policy import load_policy
 
 POLICY_PATH = Path(__file__).resolve().parents[1] / "policy.yaml"
@@ -132,6 +132,22 @@ class TestCommands:
             d = classify_checked(frame, policy)
             assert (d.action, d.command, d.sysid, d.compid) == (action, cmd, 255, 190)
 
+    def test_targets(self, policy, builder):
+        for cmd in (mav2.MAV_CMD_REQUEST_MESSAGE, mav2.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN):
+            d = classify_checked(pack(builder(cmd, target_system=7, target_component=42)), policy)
+            assert (d.target_system, d.target_component) == (7, 42)
+        # v2 strips the zero target_component (and everything after it).
+        frame = pack(builder(mav2.MAV_CMD_REQUEST_MESSAGE, target_system=7, target_component=0))
+        assert frame[1] == _COMMAND_OFFSET[frame[7]] + _TARGETS_DELTA + 1
+        d = classify_checked(frame, policy)
+        assert (d.target_system, d.target_component) == (7, 0)
+
+
+def test_non_command_has_no_targets(policy):
+    d = classify_checked(pack(mav2.MAVLink_heartbeat_message(6, 8, 0, 0, 0, 3)), policy)
+    assert d.action is Action.FORWARD
+    assert (d.command, d.target_system, d.target_component) == (None, None, None)
+
 
 def test_signed_allowed_message_forwarded(policy):
     frame = pack(mav2.MAVLink_heartbeat_message(6, 8, 0, 0, 0, 3), v2_link(signed=True))
@@ -222,3 +238,8 @@ def test_command_offsets_match_pymavlink(msgid):
     fmt = cls.unpacker.format
     idx = cls.ordered_fieldnames.index("command")
     assert struct.calcsize("<" + fmt[1 : 1 + idx]) == _COMMAND_OFFSET[msgid]
+    targets = cls.ordered_fieldnames.index("target_system")
+    assert cls.ordered_fieldnames[targets + 1] == "target_component"
+    assert struct.calcsize("<" + fmt[1 : 1 + targets]) == (
+        _COMMAND_OFFSET[msgid] + _TARGETS_DELTA
+    )
