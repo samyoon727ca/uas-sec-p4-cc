@@ -1,11 +1,15 @@
 """Minimal UDP MAVLink proxy between the GCS link and the flight controller.
 
-Uplink (GCS -> FC) is filtered: every received datagram is split into MAVLink
-frames (one datagram may carry several), each frame is passed to
-:func:`cc_proxy.classifier.classify`, and only the allowed frames are sent to
-the FC, one datagram per frame. What is sent is a ``memoryview`` slice of the
-received datagram, never a re-encoded message, so MAVLink 2 signatures and
-every other byte survive unchanged.
+Uplink (GCS -> FC) is filtered: the datagram's source IP is mapped to a peer
+(``Policy.peer_for``, see ``peers`` in policy.yaml), every received datagram is
+split into MAVLink frames (one datagram may carry several), each frame is
+passed to :func:`cc_proxy.classifier.classify`, frames the classifier allows
+are checked against the SR-012 token bucket for ``(peer, msgid)``, and only
+frames that pass both are sent to the FC, one datagram per frame. All frames
+from a source no peer covers are dropped with reason ``"unknown_peer"``; frames
+over their rate are dropped with reason ``"rate_limited"``. What is sent is a
+``memoryview`` slice of the received datagram, never a re-encoded message, so
+MAVLink 2 signatures and every other byte survive unchanged.
 
 Downlink (FC -> GCS) is **not filtered** in this slice: datagrams arriving from
 the FC address are relayed unchanged to the most recent GCS addresses that had
@@ -15,6 +19,9 @@ source are ignored.
 Every uplink frame ends up in exactly one counter: ``forwarded[msgid]`` or
 ``dropped[(msgid, reason)]`` (``msgid`` is ``None`` when the header could not
 be parsed; a send error is counted as a drop with reason ``"send error"``).
+Frames from a known peer are also counted per peer: ``peer_forwarded[peer]``
+and ``peer_dropped[(peer, reason)]``. The ``local_peer`` from the policy is
+labelled CC-originated.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 
@@ -43,6 +51,7 @@ from .classifier import (
     classify,
 )
 from .policy import Policy, PolicyError, load_policy
+from .ratelimit import Clock, RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +60,9 @@ Address = tuple[str, int]
 MAX_DATAGRAM = 65535
 MAX_GCS_PEERS = 8  # downlink fan-out bound; oldest GCS address is evicted first
 _SELECT_TIMEOUT = 0.1
+
+UNKNOWN_PEER = "unknown_peer"
+RATE_LIMITED = "rate_limited"
 
 
 @dataclass(frozen=True)
@@ -61,6 +73,9 @@ class ProxyStats:
     dropped: dict[tuple[int | None, str], int] = field(default_factory=dict)
     downlink_relayed: int = 0
     downlink_ignored: int = 0
+    peer_forwarded: dict[str, int] = field(default_factory=dict)
+    peer_dropped: dict[tuple[str, str], int] = field(default_factory=dict)
+    local_peer: str | None = None
 
     def format(self) -> str:
         lines = ["uplink forwarded:"]
@@ -71,6 +86,14 @@ class ProxyStats:
             self.dropped.items(), key=lambda kv: (kv[0][0] is None, kv[0][0] or 0, kv[0][1])
         ):
             lines.append(f"  {_msg_name(msgid)} ({msgid}) [{reason}]: {n}")
+        lines.append("uplink per peer:")
+        names = sorted(set(self.peer_forwarded) | {name for name, _ in self.peer_dropped})
+        for name in names:
+            label = f"{name} (CC-originated)" if name == self.local_peer else name
+            lines.append(f"  {label}: forwarded {self.peer_forwarded.get(name, 0)}")
+            for (peer, reason), n in sorted(self.peer_dropped.items()):
+                if peer == name:
+                    lines.append(f"    dropped [{reason}]: {n}")
         lines.append(
             f"downlink relayed: {self.downlink_relayed} datagrams, "
             f"ignored: {self.downlink_ignored}"
@@ -127,8 +150,15 @@ def _resolve(addr: Address) -> tuple[int, tuple]:
 class Proxy:
     """UDP MAVLink proxy; run it with :meth:`start` / :meth:`stop`."""
 
-    def __init__(self, policy: Policy, listen_addr: Address, fc_addr: Address):
+    def __init__(
+        self,
+        policy: Policy,
+        listen_addr: Address,
+        fc_addr: Address,
+        clock: Clock = time.monotonic,
+    ):
         self.policy = policy
+        self._limiter = RateLimiter(policy.rate_for, clock)
         self._listen_addr = listen_addr
         self._fc_addr = fc_addr
         self._fc_sockaddr: tuple | None = None
@@ -139,6 +169,8 @@ class Proxy:
         self._lock = threading.Lock()
         self._forwarded: Counter[int] = Counter()
         self._dropped: Counter[tuple[int | None, str]] = Counter()
+        self._peer_forwarded: Counter[str] = Counter()
+        self._peer_dropped: Counter[tuple[str, str]] = Counter()
         self._downlink_relayed = 0
         self._downlink_ignored = 0
         self._gcs_peers: OrderedDict[tuple, None] = OrderedDict()
@@ -190,6 +222,9 @@ class Proxy:
                 dropped=dict(self._dropped),
                 downlink_relayed=self._downlink_relayed,
                 downlink_ignored=self._downlink_ignored,
+                peer_forwarded=dict(self._peer_forwarded),
+                peer_dropped=dict(self._peer_dropped),
+                local_peer=next((p.name for p in self.policy.peers if p.local), None),
             )
 
     def _run(self) -> None:
@@ -221,22 +256,36 @@ class Proxy:
         if received is None:
             return
         data, src = received
+        peer = self.policy.peer_for(src[0])
+        peer_name = peer.name if peer is not None else None
         any_forwarded = False
         for frame in split_frames(data):
             decision = classify(frame, self.policy)
-            if decision.action is Action.FORWARD:
-                try:
-                    self._fc_sock.sendto(frame, self._fc_sockaddr)
-                except OSError as exc:
-                    log.warning("send to FC failed: %s", exc)
-                    self._count_drop(decision.msgid, "send error")
-                    continue
-                with self._lock:
-                    self._forwarded[decision.msgid] += 1
-                any_forwarded = True
-            else:
-                log.debug("drop from %s: msgid=%s %s", src, decision.msgid, decision.reason)
-                self._count_drop(decision.msgid, decision.reason)
+            if peer is None:
+                # Classified only to count the drop under its message ID.
+                log.debug("drop from %s: msgid=%s %s", src, decision.msgid, UNKNOWN_PEER)
+                self._count_drop(decision.msgid, UNKNOWN_PEER)
+                continue
+            if decision.action is not Action.FORWARD:
+                log.debug("drop from %s (%s): msgid=%s %s",
+                          src, peer_name, decision.msgid, decision.reason)
+                self._count_drop(decision.msgid, decision.reason, peer_name)
+                continue
+            if not self._limiter.allow(peer_name, decision.msgid):
+                log.debug("drop from %s (%s): msgid=%s %s",
+                          src, peer_name, decision.msgid, RATE_LIMITED)
+                self._count_drop(decision.msgid, RATE_LIMITED, peer_name)
+                continue
+            try:
+                self._fc_sock.sendto(frame, self._fc_sockaddr)
+            except OSError as exc:
+                log.warning("send to FC failed: %s", exc)
+                self._count_drop(decision.msgid, "send error", peer_name)
+                continue
+            with self._lock:
+                self._forwarded[decision.msgid] += 1
+                self._peer_forwarded[peer_name] += 1
+            any_forwarded = True
         if any_forwarded:
             with self._lock:
                 self._gcs_peers[src] = None
@@ -261,9 +310,11 @@ class Proxy:
             except OSError as exc:
                 log.debug("send to GCS %s failed: %s", peer, exc)
 
-    def _count_drop(self, msgid: int | None, reason: str) -> None:
+    def _count_drop(self, msgid: int | None, reason: str, peer: str | None = None) -> None:
         with self._lock:
             self._dropped[(msgid, reason)] += 1
+            if peer is not None:
+                self._peer_dropped[(peer, reason)] += 1
 
 
 def parse_address(value: str) -> Address:
