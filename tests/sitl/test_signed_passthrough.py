@@ -13,7 +13,10 @@ With the key installed (``signing`` fixture):
 
 1. A signed COMMAND_LONG MAV_CMD_REQUEST_MESSAGE through the proxy is acked
    ACCEPTED, the ACK is signed with the key, and the one COMMAND_LONG the proxy
-   sent to PX4 (``forward_tap``) equals the frame the client sent.
+   sent to PX4 (``forward_tap``) equals the frame the client sent. The tap is
+   the proxy's ``on_forward`` hook; that it equals what arrives on the FC
+   socket is shown in loopback by
+   ``tests/test_cmdlog.py::test_signed_command_on_wire_equals_sent_and_forward_hook``.
 2. The same command unsigned, and signed with a wrong key, is also forwarded
    unchanged (the proxy holds no key and does not judge signatures), but PX4
    does not ack it: PX4 accepts only HEARTBEAT and RADIO_STATUS unsigned once

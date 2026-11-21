@@ -39,11 +39,16 @@ are not capped: forwarded commands are already held to the SR-012 rate.
 Each line is written after the frame was sent and flushed at once. A write
 error is not caught: it stops the proxy loop (``Proxy.error``), so at most the
 one command whose line failed is forwarded without a log entry.
+
+The log holds peer addresses and the full command history, so a new file is
+created with mode ``0o600`` (owner read/write only, :data:`FILE_MODE`; POSIX).
+An existing file is appended to and keeps its mode.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -57,6 +62,9 @@ from .classifier import INCOMPAT_SIGNED, MAGIC_V2, Decision
 
 DEFAULT_PATH = "cc-commands.jsonl"
 DROP_LINES_PER_SECOND = 10
+FILE_MODE = 0o600
+# O_BINARY (Windows only): no CRT newline translation, as with built-in open().
+_OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
 _DROP_WINDOW = 1.0  # seconds
 
 
@@ -134,7 +142,12 @@ class CommandLog:
         self._clock = clock
         self._drop_limit = drop_lines_per_second
         self._drop_windows: dict[str | None, _DropWindow] = {}
-        self._file = open(self.path, "a", encoding="utf-8", newline="\n")
+        fd = os.open(self.path, _OPEN_FLAGS, FILE_MODE)
+        try:
+            self._file = os.fdopen(fd, "a", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
 
     def forwarded(self, frame: bytes, src: tuple, peer: str | None, decision: Decision) -> None:
         if decision.command is None:

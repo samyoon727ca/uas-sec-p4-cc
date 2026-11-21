@@ -2,6 +2,8 @@
 
 import json
 import socket
+import stat
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -227,6 +229,31 @@ def test_signed_command_int_with_truncated_targets(tmp_path):
         ("COMMAND_LONG", True), ("COMMAND_INT", False)
     ]
     assert (entries[1]["target_system"], entries[1]["target_component"]) == (7, 0)
+
+
+def test_signed_command_on_wire_equals_sent_and_forward_hook(tmp_path):
+    # The SITL passthrough test compares the client's frame with the on_forward
+    # hook; this shows the hook sees exactly what reaches the FC socket.
+    hooked = []
+    with make_rig(tmp_path / "cmd.jsonl", on_forward=hooked.append) as (proxy, gcs, fc):
+        frame = command_long(signed=True)
+        assert frame[2] & 0x01
+        gcs.sendto(frame, proxy.listen_address)
+        received = fc.recvfrom(65535)[0]
+        (entry,) = read_log(tmp_path / "cmd.jsonl", 1)
+    assert received == frame
+    assert hooked == [frame]
+    assert entry["signed"] is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_new_log_file_is_owner_only(tmp_path):
+    log_path = tmp_path / "cmd.jsonl"
+    with CommandLog(log_path):
+        pass
+    mode = stat.S_IMODE(log_path.stat().st_mode)
+    assert mode & 0o077 == 0, f"group/other can access the command log: {mode:o}"
+    assert mode & 0o600 == 0o600
 
 
 def test_unknown_command_number_has_null_name():

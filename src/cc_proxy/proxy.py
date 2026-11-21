@@ -163,6 +163,8 @@ class Proxy:
     the caller owns it and closes it after :meth:`stop`. ``on_forward``, if
     given, is called from the proxy thread with a copy of each frame exactly as
     it was sent to the FC (tests use it to check frames pass byte-for-byte).
+    An exception raised by ``on_forward`` is not caught: like a command-log
+    write error it stops the proxy loop (fail closed, see :attr:`error`).
     """
 
     def __init__(

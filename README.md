@@ -124,6 +124,10 @@ line:
   forwarded without a log line. Disk use therefore has to stay bounded by
   rate: forward lines by the SR-012 limits, drop lines by the cap above.
   Rotation and shipping are out of scope.
+- The log records peer addresses and the full command history, so the proxy
+  creates it with mode `0600` (owner read/write only). An existing file is
+  appended to and keeps its mode: give it `0600` yourself if you create it
+  beforehand.
 
 ## Development
 
