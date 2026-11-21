@@ -18,9 +18,10 @@ verified per `docs/08-verification-plan.md`):
 ## Scope
 
 This repo is the P4 companion-computer work package, covering VE-09 to VE-11. It
-starts with **VE-10**. The current state is the scaffold, the policy file and a
-pure-Python frame classifier (`cc_proxy.classifier.classify`). The UDP proxy,
-rate limiting, logging, peer identity and SITL tests come in later PRs.
+starts with **VE-10**. The current state is the scaffold, the policy file, a
+pure-Python frame classifier (`cc_proxy.classifier.classify`) and a minimal UDP
+proxy (`cc_proxy.proxy`). Rate limiting, logging, peer identity and SITL tests
+come in later PRs.
 
 ## Baseline
 
@@ -38,6 +39,22 @@ rates. Only the six SR-011 exclusions come from P1. The **allowlists and rates a
 proposed values for the owner to approve** (`status: proposed`), because P1 leaves
 them open. Names are resolved against pymavlink's `common` dialect, and an unknown
 name is a load error.
+
+## Running the proxy
+
+```sh
+cc-proxy --policy policy.yaml --listen 0.0.0.0:14550 --fc 127.0.0.1:14580
+```
+
+- **Uplink (GCS -> FC) is filtered.** Each datagram is split into MAVLink frames,
+  each frame is classified, and allowed frames are sent to the FC one per datagram
+  as slices of the received bytes. Nothing is re-encoded, so MAVLink 2 signatures
+  survive.
+- **Downlink (FC -> GCS) is not filtered in this slice.** Datagrams from the FC
+  address are relayed unchanged to the most recent GCS addresses (up to 8) that
+  had a frame forwarded. Datagrams from any other source are ignored.
+- Counters (`forwarded[msgid]`, `dropped[(msgid, reason)]`) are available from
+  `Proxy.stats()` and printed when the proxy stops (Ctrl-C / SIGTERM).
 
 ## Development
 

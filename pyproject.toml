@@ -13,6 +13,9 @@ dependencies = [
     "pyyaml",
 ]
 
+[project.scripts]
+cc-proxy = "cc_proxy.proxy:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
