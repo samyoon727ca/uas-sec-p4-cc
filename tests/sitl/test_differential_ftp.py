@@ -10,7 +10,9 @@ FTP ACK or NAK (``req_opcode`` 3) whatever the directory holds.
    Control: the same request sent straight to the proxy's FC-side target
    (PX4's offboard link), bypassing the proxy, is answered and the reply comes
    back through the proxy to the same connection. So that link answers FTP and
-   relays replies; the silence in step 2 is the proxy's drop.
+   relays replies; the silence in step 2 is the proxy's drop. (The bypass
+   socket does not take the link over, because the ``via_proxy`` keepalive
+   HEARTBEATs keep the proxy PX4's partner; see conftest.py.)
 """
 
 import random

@@ -74,9 +74,10 @@ the FC cannot be observed inside SITL: a request sent straight to PX4 gets a
 reaction, the same request through the proxy gets none and is counted as a drop.
 
 - The `direct` connection listens on UDP 14550, where PX4's GCS link sends.
-- The in-process proxy forwards to PX4's offboard link (UDP 14580). PX4 pairs
-  that link with the first sender for the rest of its run, so restart SITL
-  between `pytest -m sitl` runs.
+- The in-process proxy forwards to PX4's offboard link (UDP 14580). PX4 sends
+  that link's traffic to its current partner and lets another sender take over
+  after 3 s of silence, so the proxied connection sends a 1 Hz GCS HEARTBEAT
+  through the proxy while it waits for replies.
 - Without a PX4 HEARTBEAT within a few seconds the SITL tests are skipped, so
   plain `pytest` works without PX4. `CC_SITL_REQUIRED=1` (set in CI) turns that
   into a failure.

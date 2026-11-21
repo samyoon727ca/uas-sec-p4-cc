@@ -11,11 +11,13 @@ started with ``-x``, i.e. MAVLink FTP enabled):
   at 14580 and the ``via_proxy`` connection talks to the proxy.
 
 A PX4 UDP link pairs with the source address of the first datagram it receives
-and keeps sending to that address for the rest of the PX4 run. The two paths
-therefore use different links (each pairs with its own client), and the proxy
-is started once per session. Against a SITL whose offboard link already paired
-with an earlier proxy (an earlier pytest run), PX4's replies go to that old
-address; the ``via_proxy`` fixture then fails and SITL must be restarted.
+and sends everything to that address. It accepts and handles datagrams from
+any source, but once its partner has been silent for 3 s (PX4 v1.18.0-rc2,
+``Mavlink::CLIENT_SOURCE_TIMEOUT``) the next other source takes the link over.
+The two paths therefore use different links (each pairs with its own client),
+the proxy is started once per session, and the ``via_proxy`` connection sends a
+GCS HEARTBEAT at 1 Hz (through the proxy, which allows it) while it waits for
+messages, so the proxy stays PX4's partner on the offboard link.
 
 If no PX4 HEARTBEAT arrives on the GCS link, the SITL tests are skipped, so
 ``pytest`` works without PX4. Set ``CC_SITL_REQUIRED=1`` (CI does) to make that
@@ -27,7 +29,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,7 @@ REQUIRED = os.environ.get("CC_SITL_REQUIRED", "") not in ("", "0")
 # Without CC_SITL_REQUIRED only probe briefly: PX4 sends HEARTBEAT at 1 Hz.
 HEARTBEAT_TIMEOUT = 120.0 if REQUIRED else 3.0
 PAIR_TIMEOUT = 15.0
+KEEPALIVE_PERIOD = 1.0  # well inside PX4's 3 s partner timeout
 
 
 def _unavailable(reason: str):
@@ -77,10 +80,17 @@ class Link:
     conn: object
     target_system: int
     target_component: int
+    keepalive: bool = False  # send a GCS HEARTBEAT every KEEPALIVE_PERIOD in collect()
+    _last_heartbeat: float = field(default=float("-inf"), repr=False)
 
     @property
     def mav(self):
         return self.conn.mav
+
+    def heartbeat(self) -> None:
+        self.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        self._last_heartbeat = time.monotonic()
 
     def drain(self) -> None:
         while self.conn.recv_match(blocking=False) is not None:
@@ -93,6 +103,8 @@ class Link:
         """
         deadline = time.monotonic() + timeout
         while (remaining := deadline - time.monotonic()) > 0:
+            if self.keepalive and time.monotonic() - self._last_heartbeat >= KEEPALIVE_PERIOD:
+                self.heartbeat()
             msg = self.conn.recv_match(blocking=True, timeout=min(remaining, 0.5))
             if msg is not None and msg.get_type() != "BAD_DATA" and predicate(msg):
                 return [msg]
@@ -144,7 +156,8 @@ def via_proxy(direct, proxy):
     """Connection to the proxy; returns once PX4's HEARTBEAT comes back through it.
 
     Our HEARTBEAT (allowed by policy.yaml) is what pairs PX4's offboard link with
-    the proxy's FC-side socket and registers this connection as a proxy GCS peer.
+    the proxy's FC-side socket and registers this connection as a proxy GCS peer;
+    the keepalive repeats it so the pairing holds (see the module docstring).
     """
     host, port = proxy.listen_address[:2]
     conn = mavutil.mavlink_connection(
@@ -152,18 +165,11 @@ def via_proxy(direct, proxy):
         source_system=CLIENT_SYSTEM, source_component=CLIENT_COMPONENT,
     )
     try:
-        link = Link(conn, direct.target_system, AUTOPILOT_COMPONENT)
-        deadline = time.monotonic() + PAIR_TIMEOUT
-        while time.monotonic() < deadline:
-            link.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
-                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-            if link.collect(_is_px4_heartbeat, 1.0):
-                break
-        else:
+        link = Link(conn, direct.target_system, AUTOPILOT_COMPONENT, keepalive=True)
+        if not link.collect(_is_px4_heartbeat, PAIR_TIMEOUT):
             pytest.fail(
-                f"no PX4 HEARTBEAT through the proxy within {PAIR_TIMEOUT:.0f}s; PX4's "
-                f"offboard link (UDP {OFFBOARD_LINK_PORT}) may be paired with an earlier "
-                f"client: restart SITL", pytrace=False,
+                f"no PX4 HEARTBEAT through the proxy (offboard link, UDP "
+                f"{OFFBOARD_LINK_PORT}) within {PAIR_TIMEOUT:.0f}s", pytrace=False,
             )
         yield link
     finally:
