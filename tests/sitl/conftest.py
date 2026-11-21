@@ -19,6 +19,10 @@ the proxy is started once per session, and the ``via_proxy`` connection sends a
 GCS HEARTBEAT at 1 Hz (through the proxy, which allows it) while it waits for
 messages, so the proxy stays PX4's partner on the offboard link.
 
+The proxy writes its SR-013 command log to ``command_log_path`` (a session temp
+file) and hands every frame it sends to PX4 to ``forward_tap``, so tests can
+compare it with the frame the client sent.
+
 If no PX4 HEARTBEAT arrives on the GCS link, the SITL tests are skipped, so
 ``pytest`` works without PX4. Set ``CC_SITL_REQUIRED=1`` (CI does) to make that
 a failure instead, so a SITL that did not start cannot pass as skipped tests.
@@ -40,6 +44,7 @@ os.environ["MAVLINK20"] = "1"
 
 from pymavlink import mavutil  # noqa: E402
 
+from cc_proxy.cmdlog import CommandLog  # noqa: E402
 from cc_proxy.policy import load_policy  # noqa: E402
 from cc_proxy.proxy import Proxy  # noqa: E402
 
@@ -139,15 +144,48 @@ def fc_address():
     return SITL_HOST, OFFBOARD_LINK_PORT
 
 
+class ForwardTap:
+    """Collects every frame the proxy sends to the FC (``Proxy(on_forward=...)``).
+
+    Unbounded: a test session forwards a few hundred frames.
+    """
+
+    def __init__(self):
+        self._frames: list[bytes] = []
+
+    def __call__(self, frame: bytes) -> None:  # proxy thread; list.append is atomic
+        self._frames.append(frame)
+
+    def mark(self) -> int:
+        """Number of frames seen so far; pass it to :meth:`since`."""
+        return len(self._frames)
+
+    def since(self, mark: int) -> list[bytes]:
+        return self._frames[mark:]
+
+
 @pytest.fixture(scope="session")
-def proxy(direct, fc_address):
+def command_log_path(tmp_path_factory) -> Path:
+    """Path of the proxy's SR-013 command log for this session."""
+    return tmp_path_factory.mktemp("cmdlog") / "cc-commands.jsonl"
+
+
+@pytest.fixture(scope="session")
+def forward_tap() -> ForwardTap:
+    return ForwardTap()
+
+
+@pytest.fixture(scope="session")
+def proxy(direct, fc_address, command_log_path, forward_tap):
     """In-process proxy on an ephemeral local port, forwarding to PX4's offboard link."""
-    p = Proxy(load_policy(POLICY_PATH), (SITL_HOST, 0), fc_address)
-    p.start()
-    try:
-        yield p
-    finally:
-        p.stop()
+    with CommandLog(command_log_path) as command_log:
+        p = Proxy(load_policy(POLICY_PATH), (SITL_HOST, 0), fc_address,
+                  command_log=command_log, on_forward=forward_tap)
+        p.start()
+        try:
+            yield p
+        finally:
+            p.stop()
     assert p.error is None, f"proxy loop failed: {p.error!r}"
 
 

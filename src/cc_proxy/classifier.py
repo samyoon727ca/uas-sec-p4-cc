@@ -47,6 +47,8 @@ MSG_ID_COMMAND_LONG = 76
 # Byte offset of the uint16 ``command`` field in the wire payload. Both messages
 # put 28 bytes of 4-byte fields before it (see test_command_offsets_match_pymavlink).
 _COMMAND_OFFSET = {MSG_ID_COMMAND_INT: 28, MSG_ID_COMMAND_LONG: 28}
+# Both then put uint8 target_system, target_component right after ``command``.
+_TARGETS_DELTA = 2
 
 
 class Action(str, Enum):
@@ -62,6 +64,9 @@ class Decision:
     command: int | None = None
     sysid: int | None = None
     compid: int | None = None
+    # Payload target_system / target_component; set whenever ``command`` is.
+    target_system: int | None = None
+    target_component: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,7 +90,10 @@ def classify(frame: bytes, policy: Policy) -> Decision:
     if isinstance(header, Decision):
         return header
 
-    def decide(action: Action, reason: str, command: int | None = None) -> Decision:
+    def decide(
+        action: Action, reason: str, command: int | None = None,
+        targets: tuple[int | None, int | None] = (None, None),
+    ) -> Decision:
         return Decision(
             action=action,
             reason=reason,
@@ -93,6 +101,8 @@ def classify(frame: bytes, policy: Policy) -> Decision:
             command=command,
             sysid=header.sysid,
             compid=header.compid,
+            target_system=targets[0],
+            target_component=targets[1],
         )
 
     msg_cls = _mavlink.mavlink_map.get(header.msgid)
@@ -115,10 +125,11 @@ def classify(frame: bytes, policy: Policy) -> Decision:
     if offset is None:
         return decide(Action.FORWARD, f"message {msg_cls.msgname} allowed")
 
-    command = _read_command(frame, header, offset)
+    command = int.from_bytes(_read_payload(frame, header, offset, 2), "little")
+    targets = tuple(_read_payload(frame, header, offset + _TARGETS_DELTA, 2))
     if command not in policy.allowed_commands:
-        return decide(Action.DROP, f"command {command} not in allowlist", command)
-    return decide(Action.FORWARD, f"command {command} allowed", command)
+        return decide(Action.DROP, f"command {command} not in allowlist", command, targets)
+    return decide(Action.FORWARD, f"command {command} allowed", command, targets)
 
 
 def _parse_header(frame: bytes) -> _Header | Decision:
@@ -174,12 +185,11 @@ def _parse_header(frame: bytes) -> _Header | Decision:
     return header
 
 
-def _read_command(frame: bytes, header: _Header, offset: int) -> int:
-    """Read the uint16 command field, restoring v2 trailing-zero truncation.
+def _read_payload(frame: bytes, header: _Header, offset: int, size: int) -> bytes:
+    """``size`` payload bytes at ``offset``, restoring v2 trailing-zero truncation.
 
-    MAVLink 2 senders strip trailing zero bytes from the payload, so the
-    command field may be partly or wholly absent; missing bytes are zero.
+    MAVLink 2 senders strip trailing zero bytes from the payload, so a field
+    may be partly or wholly absent; missing bytes are zero.
     """
     payload = frame[header.header_len : header.header_len + header.payload_len]
-    field = payload[offset : offset + 2].ljust(2, b"\x00")
-    return int.from_bytes(field, "little")
+    return payload[offset : offset + size].ljust(size, b"\x00")
