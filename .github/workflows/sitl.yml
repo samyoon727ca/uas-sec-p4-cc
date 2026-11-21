@@ -1,0 +1,105 @@
+name: sitl
+
+# Differential PX4 SITL tests (issue #3): build PX4 SITL (px4_sitl_default),
+# start it headless with the SIH model (simulation inside PX4, no simulator or
+# GUI), then run `pytest -m sitl` against it.
+#
+# The PX4 pins, build container and the clone/cache/build steps are copied from
+# the P3 repo samyoon727ca/uas-sec-p3-pki at commit eaa2824 (2026-11-20):
+# .github/workflows/sitl.yml (job phase0) and versions.toml. P3 pins PX4
+# v1.18.0-rc2 at commit 6d1773f4c1ca7d218074ea71a26f05abd46e2bf1, built in the
+# px4-dev container below; SITL is started as P3's harness/sitl.py does
+# (PX4_SIM_MODEL=sihsim_quadx, `px4 -d -i 0 -w <workdir> <etc>`). Keep these in
+# step with P3: change them only when P3 moves its pin.
+#
+# The build is cached keyed on the PX4 tag, commit and build container, so a
+# rerun restores it and skips the submodule fetch and the build. The step
+# summary shows whether the cache was hit.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PX4_REPO: https://github.com/PX4/PX4-Autopilot.git
+  PX4_TAG: v1.18.0-rc2
+  PX4_COMMIT: 6d1773f4c1ca7d218074ea71a26f05abd46e2bf1
+  # First 16 hex digits of the container digest below (as P3 keys its cache).
+  PX4_CONTAINER_DIGEST: 5e7ad18c75c3a5a6
+
+jobs:
+  sitl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      # P3 versions.toml [px4].container (the job container cannot read `env`).
+      image: ghcr.io/px4/px4-dev@sha256:5e7ad18c75c3a5a655d5adfde4ab1eb216dd4bee7710941b6cd122f3969a7fed
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Actions are pinned to full commit SHAs (same as P3); the tag is noted for review.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trust checkouts owned by the runner user
+        run: git config --global --add safe.directory '*'
+      - name: Clone PX4 at the pinned tag and check the commit
+        run: |
+          git clone --quiet --depth 1 --branch "$PX4_TAG" "$PX4_REPO" .px4/src
+          got=$(git -C .px4/src rev-parse HEAD)
+          if [[ $got != "$PX4_COMMIT" ]]; then
+            echo "PX4 $PX4_TAG is $got, not the pinned $PX4_COMMIT" >&2
+            exit 1
+          fi
+          echo "PX4 $PX4_TAG at $got"
+      - name: Restore the cached SITL build
+        id: sitl-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .px4/sitl
+          key: px4-sitl-default-${{ env.PX4_TAG }}-${{ env.PX4_COMMIT }}-${{ env.PX4_CONTAINER_DIGEST }}
+      - name: Report cache result
+        run: |
+          echo "PX4 SITL build cache hit: ${{ steps.sitl-cache.outputs.cache-hit == 'true' }}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Fetch PX4 submodules and build px4_sitl_default
+        if: steps.sitl-cache.outputs.cache-hit != 'true'
+        env:
+          CI: "true"  # PX4's build then updates submodules without asking
+        run: |
+          git -C .px4/src submodule update --init --recursive --depth 1 --jobs 8
+          make -C .px4/src px4_sitl_default
+          # Keep only what running SITL needs: bin/ (px4, px4-alias.sh and the
+          # px4-<module> symlinks rcS calls) and the ROMFS (etc/).
+          mkdir -p .px4/sitl
+          cp -a .px4/src/build/px4_sitl_default/bin .px4/sitl/bin
+          cp -rL .px4/src/build/px4_sitl_default/etc .px4/sitl/etc
+          {
+            echo "px4_tag: $PX4_TAG"
+            echo "px4_commit: $(git -C .px4/src rev-parse HEAD)"
+            echo "px4_describe: $(git -C .px4/src describe --tags --always)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ) in run ${{ github.run_id }}"
+          } > .px4/sitl/build-info.txt
+      - name: Install cc_proxy
+        run: python3 -m pip install --quiet --break-system-packages -e ".[dev]"
+      - name: Start SITL headless and run the SITL tests
+        env:
+          CC_SITL_REQUIRED: "1"  # no PX4 HEARTBEAT is a failure here, not a skip
+        run: |
+          mkdir -p results .sitl-root
+          cp .px4/sitl/build-info.txt results/px4-build-info.txt
+          PX4_SIM_MODEL=sihsim_quadx HEADLESS=1 "$PWD/.px4/sitl/bin/px4" -d -i 0 \
+            -w "$PWD/.sitl-root" "$PWD/.px4/sitl/etc" < /dev/null > results/px4-console.log 2>&1 &
+          px4_pid=$!
+          # Stop PX4 the way P3 does (SIGINT); keep pytest's exit status.
+          trap 'kill -INT "$px4_pid" 2>/dev/null; wait "$px4_pid" || true' EXIT
+          python3 -m pytest -m sitl -v -p no:cacheprovider
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: sitl-results
+          path: results/
+          if-no-files-found: warn

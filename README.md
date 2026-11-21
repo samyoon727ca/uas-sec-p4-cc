@@ -20,8 +20,9 @@ verified per `docs/08-verification-plan.md`):
 This repo is the P4 companion-computer work package, covering VE-09 to VE-11. It
 starts with **VE-10**. The current state is the scaffold, the policy file, a
 pure-Python frame classifier (`cc_proxy.classifier.classify`) and a minimal UDP
-proxy (`cc_proxy.proxy`). Rate limiting, logging, peer identity and SITL tests
-come in later PRs.
+proxy (`cc_proxy.proxy`), with a first differential PX4 SITL test (FTP blocked,
+`MAV_CMD_REQUEST_MESSAGE` acked). Rate limiting, logging, peer identity and the
+other SITL tests come in later PRs.
 
 ## Baseline
 
@@ -62,4 +63,24 @@ cc-proxy --policy policy.yaml --listen 0.0.0.0:14550 --fc 127.0.0.1:14580
 pip install -e .[dev]
 ruff check .
 pytest -m "not sitl"
+```
+
+### SITL tests
+
+`tests/sitl` runs against a PX4 SITL started outside pytest (CI:
+`.github/workflows/sitl.yml`, PX4 `v1.18.0-rc2` as pinned by the P3 repo,
+SIH model, headless). Each block is shown differentially, because what reaches
+the FC cannot be observed inside SITL: a request sent straight to PX4 gets a
+reaction, the same request through the proxy gets none and is counted as a drop.
+
+- The `direct` connection listens on UDP 14550, where PX4's GCS link sends.
+- The in-process proxy forwards to PX4's offboard link (UDP 14580). PX4 pairs
+  that link with the first sender for the rest of its run, so restart SITL
+  between `pytest -m sitl` runs.
+- Without a PX4 HEARTBEAT within a few seconds the SITL tests are skipped, so
+  plain `pytest` works without PX4. `CC_SITL_REQUIRED=1` (set in CI) turns that
+  into a failure.
+
+```sh
+pytest -m sitl
 ```
