@@ -214,13 +214,14 @@ def test_split_frames_returns_views_of_datagram():
     assert all(f.obj is data for f in frames)
 
 
-def test_cli_starts_and_stops_on_interrupt():
+def test_cli_starts_and_stops_on_interrupt(tmp_path):
+    command_log = tmp_path / "commands.jsonl"
     kwargs = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(
         [sys.executable, "-m", "cc_proxy.proxy", "--policy", str(POLICY_PATH),
-         "--listen", "127.0.0.1:0", "--fc", "127.0.0.1:9"],
+         "--listen", "127.0.0.1:0", "--fc", "127.0.0.1:9", "--command-log", str(command_log)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs,
     )
     try:
@@ -238,3 +239,4 @@ def test_cli_starts_and_stops_on_interrupt():
     assert proc.returncode == 0
     assert "uplink forwarded:" in out
     assert "uplink dropped:" in out
+    assert command_log.is_file()
