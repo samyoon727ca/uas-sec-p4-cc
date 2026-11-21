@@ -29,7 +29,7 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
-    "sitl: tests that need an ArduPilot SITL instance (deselect with -m \"not sitl\")",
+    "sitl: tests that need a PX4 SITL instance (deselect with -m \"not sitl\")",
 ]
 
 [tool.ruff]
