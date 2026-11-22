@@ -3,9 +3,9 @@
 Through the proxy, the test sends MAV_CMD_REQUEST_MESSAGE (allowlisted, PX4
 acks it) and MAV_CMD_REQUEST_PROTOCOL_VERSION (harmless, but not in the
 policy.yaml allowlist). The session's command log (``command_log_path``, see
-conftest.py) must gain exactly two lines, both valid JSON with the SR-013
-fields: a ``forward`` for the first and a ``drop`` with the allowlist reason
-for the second.
+conftest.py) must gain exactly two command lines, both valid JSON with the
+SR-013 fields: a ``forward`` for the first and a ``drop`` with the allowlist
+reason for the second.
 """
 
 import json
@@ -27,6 +27,16 @@ FIELDS = ["ts", "action", "peer", "src", "sysid", "compid", "msg", "command",
 
 def log_lines(path) -> list[str]:
     return path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+
+
+def command_entries(path, start: int) -> list[dict]:
+    """Forward/drop entries in the complete lines from line ``start`` on.
+
+    The log is shared by the session, so a ``drop_suppressed`` summary for an
+    earlier test's drop window could also land in it; that is skipped.
+    """
+    entries = [json.loads(line) for line in log_lines(path)[start:] if line.endswith("\n")]
+    return [e for e in entries if e["action"] in ("forward", "drop")]
 
 
 def parse_ts(ts: str) -> datetime:
@@ -57,16 +67,17 @@ def test_proxied_commands_logged(via_proxy, proxy, command_log_path):
         via_proxy.target_system, via_proxy.target_component, DISALLOWED, 0, 0, 0, 0, 0, 0, 0, 0,
     )
     deadline = time.monotonic() + ACCOUNT_TIMEOUT
-    while (len(log_lines(command_log_path)) < lines_before + 2
+    while (len(command_entries(command_log_path, lines_before)) < 2
            and time.monotonic() < deadline):
         time.sleep(0.05)
     end = datetime.now(timezone.utc)
 
     assert proxy.stats().dropped.get(drop_key, 0) == dropped_before + 1
     new = log_lines(command_log_path)[lines_before:]
-    assert len(new) == 2, f"expected 2 new command log lines, got {new}"
     assert all(line.endswith("\n") for line in new)
-    forward, drop = (json.loads(line) for line in new)
+    entries = command_entries(command_log_path, lines_before)
+    assert len(entries) == 2, f"expected 2 new command log entries, got {new}"
+    forward, drop = entries
 
     src = f"127.0.0.1:{via_proxy.conn.port.getsockname()[1]}"
     common = {

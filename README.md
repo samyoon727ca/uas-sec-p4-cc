@@ -137,7 +137,9 @@ line:
   written, the proxy loop stops (fail closed), so at most that one command is
   forwarded without a log line. Disk use therefore has to stay bounded by
   rate: forward lines by the SR-012 limits, drop lines by the cap above.
-  Rotation and shipping are out of scope.
+  Rotation and shipping are out of scope. If closing the log on exit fails
+  too (for example the disk is still full), the error is logged, the file is
+  still closed and `cc-proxy` exits 1.
 - The log records peer addresses and the full command history, so the proxy
   creates it with mode `0600` (owner read/write only). An existing file is
   appended to and keeps its mode: give it `0600` yourself if you create it

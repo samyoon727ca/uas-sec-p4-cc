@@ -50,7 +50,10 @@ within one window.
 
 Each line is written after the frame was sent and flushed at once. A write
 error is not caught: it stops the proxy loop (``Proxy.error``), so at most the
-one command whose line failed is forwarded without a log entry.
+one command whose line failed is forwarded without a log entry. A write error
+in :meth:`CommandLog.close` (pending summaries, or the line that already failed
+still buffered) is logged and kept in ``CommandLog.error`` instead of raised:
+the proxy has stopped by then, and ``cc-proxy`` exits 1 when it is set.
 
 The log holds peer addresses and the full command history, so a new file is
 created with mode ``0o600`` (owner read/write only, :data:`FILE_MODE`; POSIX).
@@ -60,6 +63,7 @@ An existing file is appended to and keeps its mode.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -78,6 +82,8 @@ FILE_MODE = 0o600
 # O_BINARY (Windows only): no CRT newline translation, as with built-in open().
 _OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
 _DROP_WINDOW = 1.0  # seconds
+
+log = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -154,6 +160,7 @@ class CommandLog:
         self._clock = clock
         self._drop_limit = drop_lines_per_second
         self._drop_windows: dict[str | None, _DropWindow] = {}
+        self.error: OSError | None = None  # write error in close()
         fd = os.open(self.path, _OPEN_FLAGS, FILE_MODE)
         try:
             self._file = os.fdopen(fd, "a", encoding="utf-8", newline="\n")
@@ -208,13 +215,22 @@ class CommandLog:
         self._file.flush()
 
     def close(self) -> None:
+        """Write the pending summary lines and close the file.
+
+        The file is closed even if a write fails; the error is then logged and
+        stored in :attr:`error`, not raised (see the module docstring).
+        """
         if self._file.closed:
             return
         try:
-            for peer in list(self._drop_windows):
-                self._end_window(peer)
-        finally:
-            self._file.close()
+            try:
+                for peer in list(self._drop_windows):
+                    self._end_window(peer)
+            finally:
+                self._file.close()
+        except OSError as exc:
+            self.error = exc
+            log.error("cannot write command log %s on close: %s", self.path, exc)
 
     def __enter__(self) -> CommandLog:
         return self

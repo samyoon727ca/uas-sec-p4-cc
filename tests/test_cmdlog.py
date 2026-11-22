@@ -2,8 +2,10 @@
 
 import errno
 import json
+import re
 import socket
 import stat
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -247,15 +249,16 @@ def test_signed_command_on_wire_equals_sent_and_forward_hook(tmp_path):
     assert entry["signed"] is True
 
 
+def enospc_write(entry):
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
 def test_log_write_error_stops_proxy(tmp_path):
     # Fail closed: a log write error is not caught, so the proxy loop stops and
     # nothing more is forwarded. Not make_rig: that asserts proxy.error is None.
-    def fail_write(entry):
-        raise OSError(errno.ENOSPC, "No space left on device")
-
     fc, gcs = udp_socket(), udp_socket()
     command_log = CommandLog(tmp_path / "cmd.jsonl")
-    command_log._write = fail_write
+    command_log._write = enospc_write
     proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), fc.getsockname(),
                   command_log=command_log)
     proxy.start()
@@ -277,6 +280,53 @@ def test_log_write_error_stops_proxy(tmp_path):
         gcs.close()
         fc.close()
         command_log.close()
+
+
+def test_close_write_error_logged_not_raised(tmp_path, caplog):
+    # Disk full with a suppressed drop pending: close() cannot write the
+    # summary but must still close the file and not raise.
+    frame, decision = disallowed_decision()
+    command_log = CommandLog(tmp_path / "cmd.jsonl", clock=FakeClock(), drop_lines_per_second=0)
+    command_log.dropped(frame, ("127.0.0.1", 1), "cc-local", decision, "x")  # suppressed
+    command_log._write = enospc_write
+    command_log.close()
+    assert command_log._file.closed
+    assert isinstance(command_log.error, OSError)
+    assert command_log.error.errno == errno.ENOSPC
+    assert "cannot write command log" in caplog.text
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full (Linux)")
+def test_cli_log_disk_full_exits_1_without_uncaught_error():
+    # Every write to /dev/full fails with ENOSPC: the first command's line stops
+    # the proxy loop, and closing the log fails again (the line is still
+    # buffered). The CLI must still print its stats and return 1.
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "cc_proxy.proxy", "--policy", str(POLICY_PATH),
+         "--listen", "127.0.0.1:0", "--fc", "127.0.0.1:9", "--command-log", "/dev/full"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        for line in proc.stderr:
+            if "listening on" in line:
+                break
+        else:
+            pytest.fail(f"proxy did not start: {proc.communicate()}")
+        port = int(re.search(r"listening on 127\.0\.0\.1:(\d+)", line).group(1))
+        gcs = udp_socket()
+        try:
+            gcs.sendto(command_long(), ("127.0.0.1", port))
+        finally:
+            gcs.close()
+        out, err = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 1
+    assert "uplink forwarded:" in out
+    # Last stderr line is the close() error, not an uncaught exception.
+    assert "cannot write command log /dev/full on close" in err.rstrip().splitlines()[-1], err
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")

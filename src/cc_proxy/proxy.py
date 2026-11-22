@@ -425,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             proxy.stop()
             print(proxy.stats().format(), flush=True)
-    return 1 if proxy.error is not None else 0
+    return 1 if proxy.error is not None or command_log.error is not None else 0
 
 
 if __name__ == "__main__":
