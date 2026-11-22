@@ -22,6 +22,11 @@ be parsed; a send error is counted as a drop with reason ``"send error"``).
 Frames from a known peer are also counted per peer: ``peer_forwarded[peer]``
 and ``peer_dropped[(peer, reason)]``. The ``local_peer`` from the policy is
 labelled CC-originated.
+
+COMMAND_LONG / COMMAND_INT frames are also written to the SR-013 command log
+(:class:`cc_proxy.cmdlog.CommandLog`), forwarded and dropped alike (drop
+lines are capped per peer; the proxy loop calls ``tick`` to write the
+suppressed-drop summaries).
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ import sys
 import threading
 import time
 from collections import Counter, OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from pymavlink.dialects.v20 import common as _mavlink
@@ -48,8 +54,11 @@ from .classifier import (
     V1_HEADER_LEN,
     V2_HEADER_LEN,
     Action,
+    Decision,
     classify,
 )
+from .cmdlog import DEFAULT_PATH as DEFAULT_COMMAND_LOG
+from .cmdlog import CommandLog
 from .policy import Policy, PolicyError, load_policy
 from .ratelimit import Clock, RateLimiter
 
@@ -148,7 +157,15 @@ def _resolve(addr: Address) -> tuple[int, tuple]:
 
 
 class Proxy:
-    """UDP MAVLink proxy; run it with :meth:`start` / :meth:`stop`."""
+    """UDP MAVLink proxy; run it with :meth:`start` / :meth:`stop`.
+
+    ``command_log`` receives every command frame (see :mod:`cc_proxy.cmdlog`);
+    the caller owns it and closes it after :meth:`stop`. ``on_forward``, if
+    given, is called from the proxy thread with a copy of each frame exactly as
+    it was sent to the FC (tests use it to check frames pass byte-for-byte).
+    An exception raised by ``on_forward`` is not caught: like a command-log
+    write error it stops the proxy loop (fail closed, see :attr:`error`).
+    """
 
     def __init__(
         self,
@@ -156,8 +173,12 @@ class Proxy:
         listen_addr: Address,
         fc_addr: Address,
         clock: Clock = time.monotonic,
+        command_log: CommandLog | None = None,
+        on_forward: Callable[[bytes], None] | None = None,
     ):
         self.policy = policy
+        self._command_log = command_log
+        self._on_forward = on_forward
         self._limiter = RateLimiter(policy.rate_for, clock)
         self._listen_addr = listen_addr
         self._fc_addr = fc_addr
@@ -235,6 +256,8 @@ class Proxy:
             while not self._stop_event.is_set():
                 for key, _ in sel.select(timeout=_SELECT_TIMEOUT):
                     key.data()
+                if self._command_log is not None:
+                    self._command_log.tick()
         except BaseException as exc:
             self.error = exc
             log.exception("proxy loop failed")
@@ -264,28 +287,32 @@ class Proxy:
             if peer is None:
                 # Classified only to count the drop under its message ID.
                 log.debug("drop from %s: msgid=%s %s", src, decision.msgid, UNKNOWN_PEER)
-                self._count_drop(decision.msgid, UNKNOWN_PEER)
+                self._drop(frame, src, decision, UNKNOWN_PEER)
                 continue
             if decision.action is not Action.FORWARD:
                 log.debug("drop from %s (%s): msgid=%s %s",
                           src, peer_name, decision.msgid, decision.reason)
-                self._count_drop(decision.msgid, decision.reason, peer_name)
+                self._drop(frame, src, decision, decision.reason, peer_name)
                 continue
             if not self._limiter.allow(peer_name, decision.msgid):
                 log.debug("drop from %s (%s): msgid=%s %s",
                           src, peer_name, decision.msgid, RATE_LIMITED)
-                self._count_drop(decision.msgid, RATE_LIMITED, peer_name)
+                self._drop(frame, src, decision, RATE_LIMITED, peer_name)
                 continue
             try:
                 self._fc_sock.sendto(frame, self._fc_sockaddr)
             except OSError as exc:
                 log.warning("send to FC failed: %s", exc)
-                self._count_drop(decision.msgid, "send error", peer_name)
+                self._drop(frame, src, decision, "send error", peer_name)
                 continue
             with self._lock:
                 self._forwarded[decision.msgid] += 1
                 self._peer_forwarded[peer_name] += 1
             any_forwarded = True
+            if self._command_log is not None:
+                self._command_log.forwarded(frame, src, peer_name, decision)
+            if self._on_forward is not None:
+                self._on_forward(bytes(frame))
         if any_forwarded:
             with self._lock:
                 self._gcs_peers[src] = None
@@ -310,11 +337,16 @@ class Proxy:
             except OSError as exc:
                 log.debug("send to GCS %s failed: %s", peer, exc)
 
-    def _count_drop(self, msgid: int | None, reason: str, peer: str | None = None) -> None:
+    def _drop(
+        self, frame: memoryview, src: tuple, decision: Decision, reason: str,
+        peer: str | None = None,
+    ) -> None:
         with self._lock:
-            self._dropped[(msgid, reason)] += 1
+            self._dropped[(decision.msgid, reason)] += 1
             if peer is not None:
                 self._peer_dropped[(peer, reason)] += 1
+        if self._command_log is not None:
+            self._command_log.dropped(frame, src, peer, decision, reason)
 
 
 def parse_address(value: str) -> Address:
@@ -342,6 +374,10 @@ def main(argv: list[str] | None = None) -> int:
         "--listen", required=True, type=parse_address, help="GCS-side HOST:PORT to bind"
     )
     parser.add_argument("--fc", required=True, type=parse_address, help="FC HOST:PORT")
+    parser.add_argument(
+        "--command-log", default=DEFAULT_COMMAND_LOG,
+        help=f"JSON-lines command log to append to (default: {DEFAULT_COMMAND_LOG})",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="log every drop")
     args = parser.parse_args(argv)
 
@@ -365,25 +401,31 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _request_stop)
 
-    proxy = Proxy(policy, args.listen, args.fc)
     try:
-        proxy.start()
+        command_log = CommandLog(args.command_log)
     except OSError as exc:
-        print(f"cc-proxy: cannot open sockets: {exc}", file=sys.stderr)
+        print(f"cc-proxy: cannot open command log: {exc}", file=sys.stderr)
         return 1
+    with command_log:
+        proxy = Proxy(policy, args.listen, args.fc, command_log=command_log)
+        try:
+            proxy.start()
+        except OSError as exc:
+            print(f"cc-proxy: cannot open sockets: {exc}", file=sys.stderr)
+            return 1
 
-    listen = proxy.listen_address
-    log.info(
-        "listening on %s:%s, forwarding to %s:%s (policy status: %s)",
-        listen[0], listen[1], args.fc[0], args.fc[1], policy.status,
-    )
-    try:
-        while proxy.running and not stop.wait(0.5):
-            pass
-    finally:
-        proxy.stop()
-        print(proxy.stats().format(), flush=True)
-    return 1 if proxy.error is not None else 0
+        listen = proxy.listen_address
+        log.info(
+            "listening on %s:%s, forwarding to %s:%s (policy status: %s, command log: %s)",
+            listen[0], listen[1], args.fc[0], args.fc[1], policy.status, command_log.path,
+        )
+        try:
+            while proxy.running and not stop.wait(0.5):
+                pass
+        finally:
+            proxy.stop()
+            print(proxy.stats().format(), flush=True)
+    return 1 if proxy.error is not None or command_log.error is not None else 0
 
 
 if __name__ == "__main__":

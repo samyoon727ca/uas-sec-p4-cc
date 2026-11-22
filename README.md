@@ -20,10 +20,11 @@ verified per `docs/08-verification-plan.md`):
 This repo is the P4 companion-computer work package, covering VE-09 to VE-11. It
 starts with **VE-10**. The current state is the scaffold, the policy file, a
 pure-Python frame classifier (`cc_proxy.classifier.classify`), per-peer token
-bucket rate limiting (`cc_proxy.ratelimit`) and a minimal UDP proxy
-(`cc_proxy.proxy`), with PX4 SITL tests (FTP blocked, `MAV_CMD_REQUEST_MESSAGE`
-acked, a flood held to its rate). The command log and the other SITL tests come
-in later PRs.
+bucket rate limiting (`cc_proxy.ratelimit`), the JSON-lines command log
+(`cc_proxy.cmdlog`) and a minimal UDP proxy (`cc_proxy.proxy`), with PX4 SITL
+tests (FTP blocked, `MAV_CMD_REQUEST_MESSAGE` acked, a flood held to its rate,
+commands logged, signed commands passed through and accepted). The other SITL
+tests come in later PRs.
 
 ## Baseline
 
@@ -73,7 +74,7 @@ use a bucket.
 ## Running the proxy
 
 ```sh
-cc-proxy --policy policy.yaml --listen 0.0.0.0:14550 --fc 127.0.0.1:14580
+cc-proxy --policy policy.yaml --listen 0.0.0.0:14550 --fc 127.0.0.1:14580   [--command-log cc-commands.jsonl]
 ```
 
 - **Uplink (GCS -> FC) is filtered.** Each datagram's source IP is mapped to a
@@ -87,6 +88,72 @@ cc-proxy --policy policy.yaml --listen 0.0.0.0:14550 --fc 127.0.0.1:14580
 - Counters (`forwarded[msgid]`, `dropped[(msgid, reason)]`, and per known peer
   `peer_forwarded[peer]`, `peer_dropped[(peer, reason)]`) are available from
   `Proxy.stats()` and printed when the proxy stops (Ctrl-C / SIGTERM).
+
+### Command log (SR-013)
+
+Every uplink `COMMAND_LONG` / `COMMAND_INT` is appended to the `--command-log`
+file (default `cc-commands.jsonl`) as one JSON object per line, flushed per
+line:
+
+```json
+{"ts": "2026-11-21T12:34:56.789012Z", "action": "forward", "peer": "cc-local", "src": "127.0.0.1:50412", "sysid": 255, "compid": 190, "msg": "COMMAND_LONG", "command": {"name": "MAV_CMD_REQUEST_MESSAGE", "number": 512}, "target_system": 1, "target_component": 1, "signed": false}
+```
+
+- `ts` is UTC (`Z`); `peer` is the name from the peer map; `src` is the packet
+  source `ip:port`; `signed` means the frame carries a MAVLink 2 signature (the
+  proxy holds no key, so it is not verified).
+- **Dropped commands are logged too** (choice made here): `"action": "drop"`
+  plus a `reason` (`command N not in allowlist`, `rate_limited`, `unknown_peer`
+  with `"peer": null`, `send error`). This records attempts as well as what
+  reached the FC; filter on `action` for forwarded commands only.
+- **Drop lines are capped** at 10 per peer per second (every `unknown_peer`
+  source shares the `null` peer's budget). Further drops in that second are
+  only counted, then summarised in one line per peer when the second ends (or
+  the proxy stops):
+  `{"ts": ..., "action": "drop_suppressed", "peer": ..., "since": ..., "suppressed": K}`.
+  Without the cap, anyone who can reach the listen port could flood
+  `COMMAND_LONG` and fill the disk; with the fail-closed rule below, that
+  would stop the proxy and cut all C2. Forward lines are not capped: forwarded
+  commands are already held to the SR-012 rate, so the cap never hides a
+  forwarded command. Exact drop counts are still in the proxy
+  counters (`dropped` by msgid and reason, `peer_dropped` by peer and
+  reason).
+- **Suppressed drops lose their detail.** Once a peer's 10 drop lines for the
+  second are used up, later dropped commands in that second appear only as
+  the `suppressed` count in the `drop_suppressed` line: their `src`, `sysid`,
+  `compid`, `command`, targets and `reason` are not logged. The trade-off cuts
+  both ways: anyone sending disallowed commands from inside a peer's
+  AllowedIPs, or from any unknown IP (all of which share the `null` peer), can
+  use up that peer's budget and hide the details of other drops in that
+  second. The summary deliberately has no per-source or per-command
+  breakdown: source address and command number are chosen by the sender, and
+  since all unknown IPs share one budget a per-source map could grow without
+  limit within one window. Drop windows are keyed only by values the policy
+  bounds (peer names), never by anything the sender controls.
+- A frame counts as a command only after it passed the structure, checksum and
+  message-allowlist checks; frames dropped earlier are not logged (their fields
+  cannot be trusted) and are only counted.
+- A forwarded command is logged right after it is sent. If the log cannot be
+  written, the proxy loop stops (fail closed), so at most that one command is
+  forwarded without a log line. The line is written after the send, not
+  before, so that a `forward` line always means the frame was handed to the
+  FC socket (a failed send is logged as a `send error` drop instead); the cost
+  is that one-command gap when the disk fills. Disk use therefore has to stay
+  bounded by rate: forward lines by the SR-012 limits, drop lines by the cap
+  above. Rotation and shipping are out of scope. If closing the log on exit
+  fails too (for example the disk is still full), the error is logged, the
+  file is still closed and `cc-proxy` exits 1. Every pending
+  `drop_suppressed` line is still attempted on close; the peer and count of
+  any that cannot be written go to the error log instead. A `drop_suppressed`
+  line reported as lost in the error log may still end up in the file: the
+  failed text can stay in the file object's write buffer, and a later flush
+  (the next summary or the final close) may write it. No count is lost, but the
+  two records can then disagree. Read such an error-log entry as "not
+  confirmed written", not "definitely absent".
+- The log records peer addresses and the full command history, so the proxy
+  creates it with mode `0600` (owner read/write only). An existing file is
+  appended to and keeps its mode: give it `0600` yourself if you create it
+  beforehand.
 
 ## Development
 
@@ -116,6 +183,22 @@ reaction, the same request through the proxy gets none and is counted as a drop.
   4 s. It checks that every frame is forwarded or counted `rate_limited`, that the
   forwarded count is within `rate * t + burst` (with a 0.5 s timing allowance) and
   that PX4 answers the forwarded requests.
+
+- `test_command_log.py` sends `MAV_CMD_REQUEST_MESSAGE` (acked) and
+  `MAV_CMD_REQUEST_PROTOCOL_VERSION` (not allowlisted) through the proxy and
+  checks the two new command-log lines.
+- `test_signed_passthrough.py` installs a fresh signing key on PX4 **directly**
+  on the GCS link (SETUP_SIGNING through the proxy is dropped by SR-011, as
+  intended), following the P3 repo's provisioning. PX4 v1.18.0-rc2 applies the
+  key to all its links. A signed `MAV_CMD_REQUEST_MESSAGE` through the proxy is
+  acked ACCEPTED and the frame the proxy sent to PX4 (seen through
+  `Proxy(on_forward=...)`) equals the frame the client sent. The same command
+  unsigned or signed with a wrong key is forwarded unchanged but not acked (with a
+  signed control acked right after), and a SETUP_SIGNING through the proxy is
+  counted as dropped. The key is removed again at the end (signed blank-key
+  SETUP_SIGNING) so the other tests in the session run unsigned. An interrupted
+  run can leave the key in the SITL working directory; start the next run with
+  a fresh one, as CI does.
 
 ```sh
 pytest -m sitl
