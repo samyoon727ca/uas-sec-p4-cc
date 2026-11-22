@@ -1,5 +1,6 @@
 """SR-013 command log (cc_proxy.cmdlog), in-process through the proxy (no SITL)."""
 
+import errno
 import json
 import socket
 import stat
@@ -244,6 +245,38 @@ def test_signed_command_on_wire_equals_sent_and_forward_hook(tmp_path):
     assert received == frame
     assert hooked == [frame]
     assert entry["signed"] is True
+
+
+def test_log_write_error_stops_proxy(tmp_path):
+    # Fail closed: a log write error is not caught, so the proxy loop stops and
+    # nothing more is forwarded. Not make_rig: that asserts proxy.error is None.
+    def fail_write(entry):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    fc, gcs = udp_socket(), udp_socket()
+    command_log = CommandLog(tmp_path / "cmd.jsonl")
+    command_log._write = fail_write
+    proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), fc.getsockname(),
+                  command_log=command_log)
+    proxy.start()
+    try:
+        frame = command_long()
+        gcs.sendto(frame, proxy.listen_address)
+        # Logged after sendto: the one command whose line failed reached the FC.
+        assert fc.recvfrom(65535)[0] == frame
+        deadline = time.monotonic() + RECV_TIMEOUT
+        while proxy.running and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not proxy.running
+        assert isinstance(proxy.error, OSError)
+        assert proxy.error.errno == errno.ENOSPC
+        gcs.sendto(command_long(), proxy.listen_address)
+        assert_silent(fc)
+    finally:
+        proxy.stop()
+        gcs.close()
+        fc.close()
+        command_log.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")

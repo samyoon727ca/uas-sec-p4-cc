@@ -34,7 +34,19 @@ the log is closed, one summary line is written per peer that had any::
 
 ``since`` is the window start (UTC). The windows are keyed by peer name only,
 which the policy bounds, never by anything the sender controls. Forward lines
-are not capped: forwarded commands are already held to the SR-012 rate.
+are not capped (forwarded commands are already held to the SR-012 rate), so the
+cap never hides a forwarded command.
+
+Suppressed drops lose their per-attempt detail: they appear only in the
+``suppressed`` count, without ``src``, ``sysid``, ``compid``, ``command``,
+targets or ``reason``. This cuts both ways: anyone sending disallowed commands
+from inside a peer's AllowedIPs, or from any unknown IP (all share the ``null``
+peer), can use up that peer's budget and hide other drops' details for that
+second. The proxy counters (``dropped`` by msgid and reason, ``peer_dropped``
+by peer and reason) still hold the exact totals. The summary has no per-source
+or per-command breakdown because those values are chosen by the sender and,
+with all unknown IPs sharing one budget, such a map could grow without limit
+within one window.
 
 Each line is written after the frame was sent and flushed at once. A write
 error is not caught: it stops the proxy loop (``Proxy.error``), so at most the

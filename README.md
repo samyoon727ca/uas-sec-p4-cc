@@ -114,8 +114,22 @@ line:
   Without the cap, anyone who can reach the listen port could flood
   `COMMAND_LONG` and fill the disk; with the fail-closed rule below, that
   would stop the proxy and cut all C2. Forward lines are not capped: forwarded
-  commands are already held to the SR-012 rate. Exact drop counts are still in
-  the proxy counters.
+  commands are already held to the SR-012 rate, so the cap never hides a
+  forwarded command. Exact drop counts are still in the proxy
+  counters (`dropped` by msgid and reason, `peer_dropped` by peer and
+  reason).
+- **Suppressed drops lose their detail.** Once a peer's 10 drop lines for the
+  second are used up, later dropped commands in that second appear only as
+  the `suppressed` count in the `drop_suppressed` line: their `src`, `sysid`,
+  `compid`, `command`, targets and `reason` are not logged. The trade-off cuts
+  both ways: anyone sending disallowed commands from inside a peer's
+  AllowedIPs, or from any unknown IP (all of which share the `null` peer), can
+  use up that peer's budget and hide the details of other drops in that
+  second. The summary deliberately has no per-source or per-command
+  breakdown: source address and command number are chosen by the sender, and
+  since all unknown IPs share one budget a per-source map could grow without
+  limit within one window. Drop windows are keyed only by values the policy
+  bounds (peer names), never by anything the sender controls.
 - A frame counts as a command only after it passed the structure, checksum and
   message-allowlist checks; frames dropped earlier are not logged (their fields
   cannot be trusted) and are only counted.
