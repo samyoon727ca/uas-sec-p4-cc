@@ -144,7 +144,12 @@ line:
   fails too (for example the disk is still full), the error is logged, the
   file is still closed and `cc-proxy` exits 1. Every pending
   `drop_suppressed` line is still attempted on close; the peer and count of
-  any that cannot be written go to the error log instead.
+  any that cannot be written go to the error log instead. A `drop_suppressed`
+  line reported as lost in the error log may still end up in the file: the
+  failed text can stay in the file object's write buffer, and a later flush
+  (the next summary or the final close) may write it. No count is lost, but the
+  two records can then disagree. Read such an error-log entry as "not
+  confirmed written", not "definitely absent".
 - The log records peer addresses and the full command history, so the proxy
   creates it with mode `0600` (owner read/write only). An existing file is
   appended to and keeps its mode: give it `0600` yourself if you create it

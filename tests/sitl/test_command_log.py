@@ -19,6 +19,7 @@ pytestmark = pytest.mark.sitl
 
 ACK_TIMEOUT = 5.0
 ACCOUNT_TIMEOUT = 2.0
+DROP_WINDOW_WAIT = 1.1  # > the command log's 1 s drop-line window
 ALLOWED = mav2.MAV_CMD_REQUEST_MESSAGE
 DISALLOWED = mav2.MAV_CMD_REQUEST_PROTOCOL_VERSION
 FIELDS = ["ts", "action", "peer", "src", "sysid", "compid", "msg", "command",
@@ -63,6 +64,11 @@ def test_proxied_commands_logged(via_proxy, proxy, command_log_path):
     )
     assert acks and acks[0].result == mav2.MAV_RESULT_ACCEPTED
 
+    # Drop lines are capped at 10 per peer per 1-second window, and the log is
+    # shared by the session. Let any cc-local drop window left by an earlier
+    # test end, so the drop line below is always written whatever the test
+    # order (command_entries skips the drop_suppressed summary this may cause).
+    time.sleep(DROP_WINDOW_WAIT)
     via_proxy.mav.command_long_send(
         via_proxy.target_system, via_proxy.target_component, DISALLOWED, 0, 0, 0, 0, 0, 0, 0, 0,
     )

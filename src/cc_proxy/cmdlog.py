@@ -55,7 +55,12 @@ in :meth:`CommandLog.close` (pending summaries, or the line that already failed
 still buffered) is logged and kept in ``CommandLog.error`` instead of raised:
 the proxy has stopped by then, and ``cc-proxy`` exits 1 when it is set. A
 failed summary does not stop the others from being attempted, and its peer and
-suppressed count go to the error log instead.
+suppressed count go to the error log instead. A ``drop_suppressed`` line
+reported as lost in the error log may still end up in the file: the failed text
+can stay in the file object's write buffer, and a later flush (the next summary
+or the final close) may write it. No count is lost, but the two records can then
+disagree; read such an error-log entry as "not confirmed written", not
+"definitely absent".
 
 The log holds peer addresses and the full command history, so a new file is
 created with mode ``0o600`` (owner read/write only, :data:`FILE_MODE`; POSIX).
@@ -222,7 +227,9 @@ class CommandLog:
         Every pending summary is attempted and the file is closed even if a
         write fails. Each error is logged (with the peer's suppressed count if
         its summary could not be written), the first is stored in
-        :attr:`error`, and none is raised (see the module docstring).
+        :attr:`error`, and none is raised (see the module docstring). A
+        summary reported as not written may still reach the file through a
+        later flush (also described there).
         """
         if self._file.closed:
             return
