@@ -16,8 +16,11 @@ the FC address are relayed unchanged to the most recent GCS addresses that had
 at least one frame forwarded. Only sources the peer map covers can have a
 frame forwarded, so only they receive downlink. The FC-side socket is
 connected to the FC address, so the kernel discards datagrams from any other
-source; any that still arrive are ignored. A datagram counts as relayed when at
-least one GCS send succeeded, otherwise as ``downlink_send_failed``.
+source; any that still arrive are ignored. A connected socket also reports an
+ICMP port-unreachable from an earlier send (FC not up yet) on a later send;
+that send is retried once before the frame counts as a send error. A datagram
+counts as relayed when at least one GCS send succeeded, otherwise as
+``downlink_send_failed``.
 
 Every uplink frame ends up in exactly one counter: ``forwarded[msgid]`` or
 ``dropped[(msgid, reason)]`` (``msgid`` is ``None`` when the header could not
@@ -311,7 +314,7 @@ class Proxy:
                 self._drop(frame, src, decision, RATE_LIMITED, peer_name)
                 continue
             try:
-                self._fc_sock.send(frame)
+                self._send_to_fc(frame)
             except OSError as exc:
                 log.warning("send to FC failed: %s", exc)
                 self._drop(frame, src, decision, "send error", peer_name)
@@ -330,6 +333,17 @@ class Proxy:
                 self._gcs_peers.move_to_end(src)
                 while len(self._gcs_peers) > MAX_GCS_PEERS:
                     self._gcs_peers.popitem(last=False)
+
+    def _send_to_fc(self, frame: memoryview) -> None:
+        try:
+            self._fc_sock.send(frame)
+        except ConnectionRefusedError as exc:
+            # A connected UDP socket reports an ICMP port-unreachable from an
+            # earlier send (FC not up yet, or restarting) on the next send,
+            # which then fails although this frame was never sent. The error
+            # is cleared once reported, so send this frame once more.
+            log.debug("send to FC refused (earlier ICMP error), retrying: %s", exc)
+            self._fc_sock.send(frame)
 
     def _on_downlink(self) -> None:
         received = self._recv(self._fc_sock)

@@ -95,6 +95,9 @@ cc-proxy --policy policy.yaml --listen 0.0.0.0:14550 --fc 127.0.0.1:14580   [--c
   had a frame forwarded. The FC-side socket is connected to the FC address, so
   the kernel discards datagrams from any other source. A datagram is counted as
   relayed when at least one GCS send succeeded, otherwise as `send failed`.
+  Being connected, the socket also reports an ICMP port-unreachable from an
+  earlier send (FC not up yet, or restarting) on a later send; the proxy sends
+  that frame once more before counting it as a `send error` drop.
 - **Downlink recipients (risk).** Only a source the peer map covers can have a
   frame forwarded, so only peers receive FC telemetry and replies. But any
   host inside a peer's AllowedIPs (for `cc-local`, any process on the CC) that
