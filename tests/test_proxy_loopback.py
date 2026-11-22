@@ -18,6 +18,7 @@ from cc_proxy.proxy import RATE_LIMITED, UNKNOWN_PEER, Proxy, split_frames
 POLICY_PATH = Path(__file__).resolve().parents[1] / "policy.yaml"
 RECV_TIMEOUT = 2.0
 SILENCE_TIMEOUT = 0.3
+SEND_DELAY = 0.3
 
 HEARTBEAT_ID = mav2.MAVLINK_MSG_ID_HEARTBEAT
 FTP_ID = mav2.MAVLINK_MSG_ID_FILE_TRANSFER_PROTOCOL
@@ -153,7 +154,37 @@ def test_fc_reply_reaches_gcs(rig):
     data, src = gcs.recvfrom(65535)
     assert data == reply
     assert src[:2] == proxy.listen_address[:2]
-    wait_until(lambda: proxy.stats().downlink_relayed == 1)
+    assert proxy.stats().downlink_relayed == 1
+
+
+def test_downlink_counted_by_the_time_gcs_receives_it(monkeypatch):
+    # The proxy thread can be descheduled right after its send to the GCS. A
+    # GCS that has received the datagram must still see it counted (the SITL
+    # control checks read downlink_relayed as soon as PX4's reply arrives).
+    # Sleeping after each send makes that window long enough to hit every time.
+    real_socket = socket.socket
+
+    class SlowSendSocket(real_socket):
+        def sendto(self, *args):
+            sent = super().sendto(*args)
+            time.sleep(SEND_DELAY)
+            return sent
+
+    with udp_socket() as fc, udp_socket() as gcs:
+        proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), fc.getsockname())
+        sockets = iter([SlowSendSocket, real_socket])  # GCS side, then FC side
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: next(sockets)(*a, **kw))
+        proxy.start()
+        monkeypatch.undo()
+        try:
+            send_up(proxy, gcs, heartbeat())
+            _, proxy_fc_side = fc.recvfrom(65535)
+            fc.sendto(heartbeat(), proxy_fc_side)
+            gcs.recvfrom(65535)
+            assert proxy.stats().downlink_relayed == 1
+        finally:
+            proxy.stop()
+    assert proxy.error is None
 
 
 def test_downlink_from_non_fc_source_filtered_by_kernel(rig):

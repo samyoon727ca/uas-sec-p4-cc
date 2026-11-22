@@ -352,20 +352,21 @@ class Proxy:
         if received is None:
             return
         data, src = received
+        # The (non-blocking) sends happen under the lock, so whoever has
+        # received the datagram and then calls stats() sees it counted.
         with self._lock:
             peers = list(self._gcs_peers)
             if src[:2] != self._fc_sockaddr[:2] or not peers:
                 self._downlink_ignored += 1
                 return
-        sent = False
-        for peer in peers:
-            try:
-                self._gcs_sock.sendto(data, peer)
-            except OSError as exc:
-                log.debug("send to GCS %s failed: %s", peer, exc)
-            else:
-                sent = True
-        with self._lock:
+            sent = False
+            for peer in peers:
+                try:
+                    self._gcs_sock.sendto(data, peer)
+                except OSError as exc:
+                    log.debug("send to GCS %s failed: %s", peer, exc)
+                else:
+                    sent = True
             if sent:
                 self._downlink_relayed += 1
             else:
