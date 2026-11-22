@@ -53,7 +53,9 @@ error is not caught: it stops the proxy loop (``Proxy.error``), so at most the
 one command whose line failed is forwarded without a log entry. A write error
 in :meth:`CommandLog.close` (pending summaries, or the line that already failed
 still buffered) is logged and kept in ``CommandLog.error`` instead of raised:
-the proxy has stopped by then, and ``cc-proxy`` exits 1 when it is set.
+the proxy has stopped by then, and ``cc-proxy`` exits 1 when it is set. A
+failed summary does not stop the others from being attempted, and its peer and
+suppressed count go to the error log instead.
 
 The log holds peer addresses and the full command history, so a new file is
 created with mode ``0o600`` (owner read/write only, :data:`FILE_MODE`; POSIX).
@@ -217,20 +219,34 @@ class CommandLog:
     def close(self) -> None:
         """Write the pending summary lines and close the file.
 
-        The file is closed even if a write fails; the error is then logged and
-        stored in :attr:`error`, not raised (see the module docstring).
+        Every pending summary is attempted and the file is closed even if a
+        write fails. Each error is logged (with the peer's suppressed count if
+        its summary could not be written), the first is stored in
+        :attr:`error`, and none is raised (see the module docstring).
         """
         if self._file.closed:
             return
         try:
-            try:
-                for peer in list(self._drop_windows):
+            for peer, window in list(self._drop_windows.items()):
+                try:
                     self._end_window(peer)
-            finally:
+                except OSError as exc:
+                    self._close_error(exc)
+                    log.error(
+                        "cannot write command log %s on close: drop_suppressed line for"
+                        " peer %r (%d suppressed since %s): %s",
+                        self.path, peer, window.suppressed, format_timestamp(window.since), exc,
+                    )
+        finally:
+            try:
                 self._file.close()
-        except OSError as exc:
+            except OSError as exc:
+                self._close_error(exc)
+                log.error("cannot write command log %s on close: %s", self.path, exc)
+
+    def _close_error(self, exc: OSError) -> None:
+        if self.error is None:
             self.error = exc
-            log.error("cannot write command log %s on close: %s", self.path, exc)
 
     def __enter__(self) -> CommandLog:
         return self

@@ -296,14 +296,37 @@ def test_close_write_error_logged_not_raised(tmp_path, caplog):
     assert "cannot write command log" in caplog.text
 
 
-@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full (Linux)")
-def test_cli_log_disk_full_exits_1_without_uncaught_error():
-    # Every write to /dev/full fails with ENOSPC: the first command's line stops
-    # the proxy loop, and closing the log fails again (the line is still
-    # buffered). The CLI must still print its stats and return 1.
+def test_close_writes_other_summaries_after_one_fails(tmp_path, caplog):
+    # The first peer's summary cannot be written: the other peers' summaries
+    # are still written, and the lost count goes to the error log.
+    log_path = tmp_path / "cmd.jsonl"
+    frame, decision = disallowed_decision()
+    command_log = CommandLog(log_path, now=lambda: FIXED_NOW, clock=FakeClock(),
+                             drop_lines_per_second=0)
+    for peer, n in (("gcs-a", 2), ("gcs-b", 3), (None, 4)):
+        for _ in range(n):
+            command_log.dropped(frame, ("127.0.0.1", 1), peer, decision, "x")  # suppressed
+    write = command_log._write
+
+    def write_fails_for_gcs_a(entry):
+        if entry["peer"] == "gcs-a":
+            enospc_write(entry)
+        write(entry)
+
+    command_log._write = write_fails_for_gcs_a
+    command_log.close()
+    assert command_log._file.closed
+    assert command_log.error.errno == errno.ENOSPC
+    entries = read_log(log_path, 2, timeout=0)
+    assert [(e["peer"], e["suppressed"]) for e in entries] == [("gcs-b", 3), (None, 4)]
+    assert "peer 'gcs-a' (2 suppressed since 2026-11-21T12:34:56.789012Z)" in caplog.text
+
+
+def run_cli_with_one_command(argv, log_path):
+    """Run ``python *argv`` as cc-proxy, send one allowed command, return (rc, stdout, stderr)."""
     proc = subprocess.Popen(
-        [sys.executable, "-m", "cc_proxy.proxy", "--policy", str(POLICY_PATH),
-         "--listen", "127.0.0.1:0", "--fc", "127.0.0.1:9", "--command-log", "/dev/full"],
+        [sys.executable, *argv, "--policy", str(POLICY_PATH),
+         "--listen", "127.0.0.1:0", "--fc", "127.0.0.1:9", "--command-log", str(log_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
@@ -323,10 +346,39 @@ def test_cli_log_disk_full_exits_1_without_uncaught_error():
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-    assert proc.returncode == 1
+    return proc.returncode, out, err
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full (Linux)")
+def test_cli_log_disk_full_exits_1_without_uncaught_error():
+    # Every write to /dev/full fails with ENOSPC: the first command's line stops
+    # the proxy loop, and closing the log fails again (the line is still
+    # buffered). The CLI must still print its stats and return 1.
+    returncode, out, err = run_cli_with_one_command(["-m", "cc_proxy.proxy"], "/dev/full")
+    assert returncode == 1
     assert "uplink forwarded:" in out
     # Last stderr line is the close() error, not an uncaught exception.
     assert "cannot write command log /dev/full on close" in err.rstrip().splitlines()[-1], err
+
+
+# cc-proxy with every command-log write failing as on a full disk (any platform).
+ENOSPC_CLI = """import errno, sys
+from cc_proxy import cmdlog, proxy
+def enospc_write(self, entry):
+    raise OSError(errno.ENOSPC, "No space left on device")
+cmdlog.CommandLog._write = enospc_write
+sys.exit(proxy.main(sys.argv[1:]))
+"""
+
+
+def test_cli_log_write_error_exits_1(tmp_path):
+    # Platform-neutral variant of the /dev/full test: the first command's log
+    # line fails, the proxy loop stops and the CLI prints its stats and returns 1.
+    returncode, out, err = run_cli_with_one_command(["-c", ENOSPC_CLI], tmp_path / "cmd.jsonl")
+    assert returncode == 1, err
+    assert "uplink forwarded:" in out
+    assert "proxy loop failed" in err
+    assert "No space left on device" in err
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
