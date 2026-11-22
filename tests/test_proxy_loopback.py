@@ -4,6 +4,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -73,6 +74,15 @@ def send_up(proxy, gcs, data):
     gcs.sendto(data, proxy.listen_address)
 
 
+def wait_until(predicate, timeout=RECV_TIMEOUT):
+    """Poll until predicate() is true; the proxy thread updates state after send."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            pytest.fail("condition not met before timeout")
+        time.sleep(0.01)
+
+
 def assert_silent(sock):
     sock.settimeout(SILENCE_TIMEOUT)
     with pytest.raises(socket.timeout):
@@ -86,7 +96,7 @@ def test_allowed_frame_arrives_byte_identical(rig):
     send_up(proxy, gcs, frame)
     data, _ = fc.recvfrom(65535)
     assert data == frame
-    assert proxy.stats().forwarded == {HEARTBEAT_ID: 1}
+    wait_until(lambda: proxy.stats().forwarded == {HEARTBEAT_ID: 1})
     assert proxy.stats().dropped == {}
 
 
@@ -143,7 +153,7 @@ def test_fc_reply_reaches_gcs(rig):
     data, src = gcs.recvfrom(65535)
     assert data == reply
     assert src[:2] == proxy.listen_address[:2]
-    assert proxy.stats().downlink_relayed == 1
+    wait_until(lambda: proxy.stats().downlink_relayed == 1)
 
 
 def test_downlink_from_non_fc_source_filtered_by_kernel(rig):
@@ -177,6 +187,10 @@ def test_downlink_counted_as_send_failed_when_no_gcs_send_succeeds(rig):
     proxy, gcs, fc = rig
     send_up(proxy, gcs, heartbeat())
     _, proxy_fc_side = fc.recvfrom(65535)
+    # Wait until the proxy has finished handling the uplink, so it cannot
+    # re-add the real GCS address after the peer list is replaced below.
+    gcs_addr = gcs.getsockname()
+    wait_until(lambda: gcs_addr in proxy._gcs_peers)
     # An IPv6 address cannot be sent to from the IPv4 GCS socket, so every
     # send to the GCS fails.
     with proxy._lock:
