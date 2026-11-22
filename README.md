@@ -23,8 +23,16 @@ pure-Python frame classifier (`cc_proxy.classifier.classify`), per-peer token
 bucket rate limiting (`cc_proxy.ratelimit`), the JSON-lines command log
 (`cc_proxy.cmdlog`) and a minimal UDP proxy (`cc_proxy.proxy`), with PX4 SITL
 tests (FTP blocked, `MAV_CMD_REQUEST_MESSAGE` acked, a flood held to its rate,
-commands logged, signed commands passed through and accepted). The other SITL
-tests come in later PRs.
+commands logged, signed commands passed through and accepted, the other five
+SR-011 exclusions dropped).
+
+## Evidence
+
+[`docs/evidence/VE-10.md`](docs/evidence/VE-10.md) traces SR-011, SR-012,
+SR-013 and their threats to the tests here, with the oracle type of each test
+and the assumptions. **VE-10 is partly evidenced, not passed**: the
+QGroundControl v5.1.5 allowlist check, real WireGuard, the hardened CC image and
+hardware are still to come.
 
 ## Baseline
 
@@ -167,9 +175,12 @@ pytest -m "not sitl"
 
 `tests/sitl` runs against a PX4 SITL started outside pytest (CI:
 `.github/workflows/sitl.yml`, PX4 `v1.18.0-rc2` as pinned by the P3 repo,
-SIH model, headless). Each block is shown differentially, because what reaches
-the FC cannot be observed inside SITL: a request sent straight to PX4 gets a
-reaction, the same request through the proxy gets none and is counted as a drop.
+SIH model, headless). Where PX4 reacts visibly, a block is shown
+differentially, because what reaches the FC cannot be observed inside SITL: a
+request sent straight to PX4 gets a reaction, the same request through the
+proxy gets none and is counted as a drop. Where PX4 shows no reaction, the test
+is **egress-only**: it checks only that the proxy counted the drop and did not
+send the frame.
 
 - The `direct` connection listens on UDP 14550, where PX4's GCS link sends.
 - The in-process proxy forwards to PX4's offboard link (UDP 14580). PX4 sends
@@ -199,6 +210,14 @@ reaction, the same request through the proxy gets none and is counted as a drop.
   SETUP_SIGNING) so the other tests in the session run unsigned. An interrupted
   run can leave the key in the SITL working directory; start the next run with
   a fresh one, as CI does.
+- `test_excluded_types.py` covers the SR-011 exclusions other than FTP.
+  Differential: SERIAL_CONTROL (MAVLink shell reply), SETUP_SIGNING (PX4 starts
+  signing with the new key; removed again after each test) and ADSB_VEHICLE
+  (PX4 re-sends the report in its own stream). Each has a direct baseline, a
+  proxied run with no reaction and one counted drop, and a control sent straight
+  to the offboard link past the proxy. Egress-only: RADIO_STATUS (PX4 throttles
+  only on links started with `-s`) and COLLISION (no receive handler in PX4
+  v1.18.0-rc2).
 
 ```sh
 pytest -m sitl
