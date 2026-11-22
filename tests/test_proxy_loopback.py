@@ -146,15 +146,67 @@ def test_fc_reply_reaches_gcs(rig):
     assert proxy.stats().downlink_relayed == 1
 
 
-def test_downlink_from_non_fc_source_ignored(rig):
+def test_downlink_from_non_fc_source_filtered_by_kernel(rig):
     proxy, gcs, fc = rig
     send_up(proxy, gcs, heartbeat())
     _, proxy_fc_side = fc.recvfrom(65535)
     with udp_socket() as intruder:
         intruder.sendto(heartbeat(), proxy_fc_side)
     assert_silent(gcs)
-    assert proxy.stats().downlink_ignored == 1
+    # The FC-side socket is connected to the FC, so the datagram never reaches
+    # the proxy at all (not even as "ignored").
+    assert proxy.stats().downlink_ignored == 0
     assert proxy.stats().downlink_relayed == 0
+
+
+def test_downlink_not_sent_to_unknown_peer():
+    raw = yaml.safe_load(POLICY_PATH.read_text(encoding="utf-8"))
+    raw["peers"] = [{"name": "gcs-primary", "allowed_ips": ["10.8.0.2/32"]}]
+    del raw["local_peer"]
+    with make_rig(parse_policy(raw)) as (proxy, gcs, fc):
+        send_up(proxy, gcs, heartbeat())
+        assert_silent(fc)
+        fc.sendto(heartbeat(), proxy._fc_sock.getsockname())
+        assert_silent(gcs)
+        stats = proxy.stats()
+    assert stats.downlink_relayed == 0
+    assert stats.downlink_ignored == 1
+
+
+def test_downlink_counted_as_send_failed_when_no_gcs_send_succeeds(rig):
+    proxy, gcs, fc = rig
+    send_up(proxy, gcs, heartbeat())
+    _, proxy_fc_side = fc.recvfrom(65535)
+    # An IPv6 address cannot be sent to from the IPv4 GCS socket, so every
+    # send to the GCS fails.
+    with proxy._lock:
+        proxy._gcs_peers.clear()
+        proxy._gcs_peers[("::1", 9)] = None
+    fc.sendto(heartbeat(), proxy_fc_side)
+    assert_silent(gcs)
+    stats = proxy.stats()
+    assert stats.downlink_relayed == 0
+    assert stats.downlink_send_failed == 1
+    assert "send failed: 1" in stats.format()
+
+
+def test_start_closes_gcs_socket_when_fc_socket_creation_fails(monkeypatch):
+    created = []
+    real_socket = socket.socket
+
+    def fake_socket(*args, **kwargs):
+        if created:
+            raise OSError("address family not supported")
+        sock = real_socket(*args, **kwargs)
+        created.append(sock)
+        return sock
+
+    proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), ("127.0.0.1", 9))
+    monkeypatch.setattr(socket, "socket", fake_socket)
+    with pytest.raises(OSError, match="address family"):
+        proxy.start()
+    assert len(created) == 1
+    assert created[0].fileno() == -1  # closed
 
 
 def test_allowed_frame_counted_for_local_peer(rig):

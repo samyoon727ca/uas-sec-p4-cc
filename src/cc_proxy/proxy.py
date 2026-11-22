@@ -13,8 +13,11 @@ MAVLink 2 signatures and every other byte survive unchanged.
 
 Downlink (FC -> GCS) is **not filtered** in this slice: datagrams arriving from
 the FC address are relayed unchanged to the most recent GCS addresses that had
-at least one frame forwarded. Datagrams on the FC-side socket from any other
-source are ignored.
+at least one frame forwarded. Only sources the peer map covers can have a
+frame forwarded, so only they receive downlink. The FC-side socket is
+connected to the FC address, so the kernel discards datagrams from any other
+source; any that still arrive are ignored. A datagram counts as relayed when at
+least one GCS send succeeded, otherwise as ``downlink_send_failed``.
 
 Every uplink frame ends up in exactly one counter: ``forwarded[msgid]`` or
 ``dropped[(msgid, reason)]`` (``msgid`` is ``None`` when the header could not
@@ -82,6 +85,7 @@ class ProxyStats:
     dropped: dict[tuple[int | None, str], int] = field(default_factory=dict)
     downlink_relayed: int = 0
     downlink_ignored: int = 0
+    downlink_send_failed: int = 0
     peer_forwarded: dict[str, int] = field(default_factory=dict)
     peer_dropped: dict[tuple[str, str], int] = field(default_factory=dict)
     local_peer: str | None = None
@@ -105,7 +109,8 @@ class ProxyStats:
                     lines.append(f"    dropped [{reason}]: {n}")
         lines.append(
             f"downlink relayed: {self.downlink_relayed} datagrams, "
-            f"ignored: {self.downlink_ignored}"
+            f"ignored: {self.downlink_ignored}, "
+            f"send failed: {self.downlink_send_failed}"
         )
         return "\n".join(lines)
 
@@ -194,6 +199,7 @@ class Proxy:
         self._peer_dropped: Counter[tuple[str, str]] = Counter()
         self._downlink_relayed = 0
         self._downlink_ignored = 0
+        self._downlink_send_failed = 0
         self._gcs_peers: OrderedDict[tuple, None] = OrderedDict()
         self.error: BaseException | None = None
 
@@ -214,15 +220,19 @@ class Proxy:
         listen_family, listen_sockaddr = _resolve(self._listen_addr)
         fc_family, self._fc_sockaddr = _resolve(self._fc_addr)
         gcs_sock = socket.socket(listen_family, socket.SOCK_DGRAM)
-        fc_sock = socket.socket(fc_family, socket.SOCK_DGRAM)
+        fc_sock = None
         try:
+            fc_sock = socket.socket(fc_family, socket.SOCK_DGRAM)
             gcs_sock.bind(listen_sockaddr)
-            fc_sock.bind(("::" if fc_family == socket.AF_INET6 else "", 0))
+            # Connected: the kernel picks the local address that routes to the
+            # FC and discards datagrams from any other source.
+            fc_sock.connect(self._fc_sockaddr)
             gcs_sock.setblocking(False)
             fc_sock.setblocking(False)
         except OSError:
             gcs_sock.close()
-            fc_sock.close()
+            if fc_sock is not None:
+                fc_sock.close()
             raise
         self._gcs_sock, self._fc_sock = gcs_sock, fc_sock
         self._thread = threading.Thread(target=self._run, name="cc-proxy", daemon=True)
@@ -243,6 +253,7 @@ class Proxy:
                 dropped=dict(self._dropped),
                 downlink_relayed=self._downlink_relayed,
                 downlink_ignored=self._downlink_ignored,
+                downlink_send_failed=self._downlink_send_failed,
                 peer_forwarded=dict(self._peer_forwarded),
                 peer_dropped=dict(self._peer_dropped),
                 local_peer=next((p.name for p in self.policy.peers if p.local), None),
@@ -300,7 +311,7 @@ class Proxy:
                 self._drop(frame, src, decision, RATE_LIMITED, peer_name)
                 continue
             try:
-                self._fc_sock.sendto(frame, self._fc_sockaddr)
+                self._fc_sock.send(frame)
             except OSError as exc:
                 log.warning("send to FC failed: %s", exc)
                 self._drop(frame, src, decision, "send error", peer_name)
@@ -330,12 +341,19 @@ class Proxy:
             if src[:2] != self._fc_sockaddr[:2] or not peers:
                 self._downlink_ignored += 1
                 return
-            self._downlink_relayed += 1
+        sent = False
         for peer in peers:
             try:
                 self._gcs_sock.sendto(data, peer)
             except OSError as exc:
                 log.debug("send to GCS %s failed: %s", peer, exc)
+            else:
+                sent = True
+        with self._lock:
+            if sent:
+                self._downlink_relayed += 1
+            else:
+                self._downlink_send_failed += 1
 
     def _drop(
         self, frame: memoryview, src: tuple, decision: Decision, reason: str,
