@@ -337,11 +337,13 @@ class Proxy:
     def _send_to_fc(self, frame: memoryview) -> None:
         try:
             self._fc_sock.send(frame)
-        except ConnectionRefusedError as exc:
+        except (ConnectionRefusedError, ConnectionResetError) as exc:
             # A connected UDP socket reports an ICMP port-unreachable from an
             # earlier send (FC not up yet, or restarting) on the next send,
-            # which then fails although this frame was never sent. The error
-            # is cleared once reported, so send this frame once more.
+            # which then fails although this frame was never sent: Linux
+            # raises ECONNREFUSED (ConnectionRefusedError), Windows raises
+            # WSAECONNRESET (ConnectionResetError). The error is cleared once
+            # reported, so send this frame once more.
             log.debug("send to FC refused (earlier ICMP error), retrying: %s", exc)
             self._fc_sock.send(frame)
 

@@ -223,11 +223,13 @@ def test_start_closes_gcs_socket_when_fc_socket_creation_fails(monkeypatch):
     assert created[0].fileno() == -1  # closed
 
 
+@pytest.mark.parametrize("error", [ConnectionRefusedError, ConnectionResetError])
 @pytest.mark.parametrize("refusals, forwarded", [(1, True), (2, False)])
-def test_fc_send_retried_once_after_icmp_refusal(monkeypatch, refusals, forwarded):
-    # A connected UDP socket raises ConnectionRefusedError on the send after an
-    # ICMP port-unreachable (FC not up yet). Simulated here, since loopback
-    # does not report it the same way on every OS.
+def test_fc_send_retried_once_after_icmp_refusal(monkeypatch, refusals, forwarded, error):
+    # A connected UDP socket fails the send after an ICMP port-unreachable (FC
+    # not up yet): ConnectionRefusedError on Linux, ConnectionResetError
+    # (WSAECONNRESET) on Windows. Simulated here, since loopback does not
+    # report it the same way on every OS.
     real_socket = socket.socket
 
     class RefusingSocket(real_socket):
@@ -236,7 +238,7 @@ def test_fc_send_retried_once_after_icmp_refusal(monkeypatch, refusals, forwarde
         def send(self, data, *args):
             if RefusingSocket.remaining:
                 RefusingSocket.remaining -= 1
-                raise ConnectionRefusedError("connection refused")
+                raise error("connection refused")
             return super().send(data, *args)
 
     with udp_socket() as fc, udp_socket() as gcs:
