@@ -9,8 +9,10 @@ name: sitl
 # .github/workflows/sitl.yml (job phase0) and versions.toml. P3 pins PX4
 # v1.18.0-rc2 at commit 6d1773f4c1ca7d218074ea71a26f05abd46e2bf1, built in the
 # px4-dev container below; SITL is started as P3's harness/sitl.py does
-# (PX4_SIM_MODEL=sihsim_quadx, `px4 -d -i 0 -w <workdir> <etc>`). Keep these in
-# step with P3: change them only when P3 moves its pin.
+# (PX4_SIM_MODEL=sihsim_quadx, `px4 -d -i 0 -w <workdir> <etc>`). P3 also pins
+# pymavlink 2.4.50 (versions.toml), installed below as PYMAVLINK_VERSION so both
+# repos' SITL evidence comes from the same pymavlink build. Keep these in step
+# with P3: change them only when P3 moves its pin.
 #
 # The build is cached keyed on the PX4 tag, commit and build container, so a
 # rerun restores it and skips the submodule fetch and the build. The step
@@ -29,6 +31,8 @@ env:
   PX4_COMMIT: 6d1773f4c1ca7d218074ea71a26f05abd46e2bf1
   # First 16 hex digits of the container digest below (as P3 keys its cache).
   PX4_CONTAINER_DIGEST: 5e7ad18c75c3a5a6
+  # P3 versions.toml pymavlink pin.
+  PYMAVLINK_VERSION: 2.4.50
 
 jobs:
   sitl:
@@ -83,8 +87,10 @@ jobs:
             echo "px4_describe: $(git -C .px4/src describe --tags --always)"
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ) in run ${{ github.run_id }}"
           } > .px4/sitl/build-info.txt
-      - name: Install cc_proxy
-        run: python3 -m pip install --quiet --break-system-packages -e ".[dev]"
+      - name: Install cc_proxy with P3's pymavlink
+        run: |
+          python3 -m pip install --quiet --break-system-packages -e ".[dev]" "pymavlink==$PYMAVLINK_VERSION"
+          python3 -m pip show pymavlink | grep '^Version:'
       - name: Start SITL headless and run the SITL tests
         env:
           CC_SITL_REQUIRED: "1"  # no PX4 HEARTBEAT is a failure here, not a skip
@@ -96,7 +102,26 @@ jobs:
           px4_pid=$!
           # Stop PX4 the way P3 does (SIGINT); keep pytest's exit status.
           trap 'kill -INT "$px4_pid" 2>/dev/null; wait "$px4_pid" || true' EXIT
-          python3 -m pytest -m sitl -v -p no:cacheprovider
+          # A PX4 that dies at startup would otherwise only show up as pytest
+          # waiting out its HEARTBEAT timeout.
+          sleep 5
+          if ! kill -0 "$px4_pid" 2>/dev/null; then
+            echo "PX4 SITL exited during startup; tail of results/px4-console.log:" >&2
+            tail -n 50 results/px4-console.log >&2
+            exit 1
+          fi
+          status=0
+          python3 -m pytest -m sitl -v -p no:cacheprovider || status=$?
+          if [[ $status -ne 0 ]]; then
+            if kill -0 "$px4_pid" 2>/dev/null; then
+              echo "pytest failed (exit $status); PX4 SITL is still running." >&2
+            else
+              echo "pytest failed (exit $status); PX4 SITL is no longer running." >&2
+            fi
+            echo "Tail of results/px4-console.log:" >&2
+            tail -n 50 results/px4-console.log >&2
+          fi
+          exit "$status"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
