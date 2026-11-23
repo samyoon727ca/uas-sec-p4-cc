@@ -92,7 +92,19 @@ cc-proxy --policy policy.yaml --listen 0.0.0.0:14550 --fc 127.0.0.1:14580   [--c
   survive.
 - **Downlink (FC -> GCS) is not filtered in this slice.** Datagrams from the FC
   address are relayed unchanged to the most recent GCS addresses (up to 8) that
-  had a frame forwarded. Datagrams from any other source are ignored.
+  had a frame forwarded. The FC-side socket is connected to the FC address, so
+  the kernel discards datagrams from any other source. A datagram is counted as
+  relayed when at least one GCS send succeeded, otherwise as `send failed`.
+  Being connected, the socket also reports an ICMP port-unreachable from an
+  earlier send (FC not up yet, or restarting) on a later send; the proxy sends
+  that frame once more before counting it as a `send error` drop.
+- **Downlink recipients (risk).** Only a source the peer map covers can have a
+  frame forwarded, so only peers receive FC telemetry and replies. But any
+  host inside a peer's AllowedIPs (for `cc-local`, any process on the CC) that
+  gets one allowed frame forwarded, such as a HEARTBEAT, joins the fan-out
+  list. Sending from 8 source ports fills the list, so it receives all
+  downlink and pushes the real GCS off until that GCS's next forwarded frame.
+  Without WireGuard in front of the proxy, a spoofed source IP can do the same.
 - Counters (`forwarded[msgid]`, `dropped[(msgid, reason)]`, and per known peer
   `peer_forwarded[peer]`, `peer_dropped[(peer, reason)]`) are available from
   `Proxy.stats()` and printed when the proxy stops (Ctrl-C / SIGTERM).

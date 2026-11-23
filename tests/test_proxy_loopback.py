@@ -4,6 +4,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from cc_proxy.proxy import RATE_LIMITED, UNKNOWN_PEER, Proxy, split_frames
 POLICY_PATH = Path(__file__).resolve().parents[1] / "policy.yaml"
 RECV_TIMEOUT = 2.0
 SILENCE_TIMEOUT = 0.3
+SEND_DELAY = 0.3
 
 HEARTBEAT_ID = mav2.MAVLINK_MSG_ID_HEARTBEAT
 FTP_ID = mav2.MAVLINK_MSG_ID_FILE_TRANSFER_PROTOCOL
@@ -73,6 +75,15 @@ def send_up(proxy, gcs, data):
     gcs.sendto(data, proxy.listen_address)
 
 
+def wait_until(predicate, timeout=RECV_TIMEOUT):
+    """Poll until predicate() is true; the proxy thread updates state after send."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            pytest.fail("condition not met before timeout")
+        time.sleep(0.01)
+
+
 def assert_silent(sock):
     sock.settimeout(SILENCE_TIMEOUT)
     with pytest.raises(socket.timeout):
@@ -86,7 +97,7 @@ def test_allowed_frame_arrives_byte_identical(rig):
     send_up(proxy, gcs, frame)
     data, _ = fc.recvfrom(65535)
     assert data == frame
-    assert proxy.stats().forwarded == {HEARTBEAT_ID: 1}
+    wait_until(lambda: proxy.stats().forwarded == {HEARTBEAT_ID: 1})
     assert proxy.stats().dropped == {}
 
 
@@ -146,15 +157,142 @@ def test_fc_reply_reaches_gcs(rig):
     assert proxy.stats().downlink_relayed == 1
 
 
-def test_downlink_from_non_fc_source_ignored(rig):
+def test_downlink_counted_by_the_time_gcs_receives_it(monkeypatch):
+    # The proxy thread can be descheduled right after its send to the GCS. A
+    # GCS that has received the datagram must still see it counted (the SITL
+    # control checks read downlink_relayed as soon as PX4's reply arrives).
+    # Sleeping after each send makes that window long enough to hit every time.
+    real_socket = socket.socket
+
+    class SlowSendSocket(real_socket):
+        def sendto(self, *args):
+            sent = super().sendto(*args)
+            time.sleep(SEND_DELAY)
+            return sent
+
+    with udp_socket() as fc, udp_socket() as gcs:
+        proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), fc.getsockname())
+        sockets = iter([SlowSendSocket, real_socket])  # GCS side, then FC side
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: next(sockets)(*a, **kw))
+        proxy.start()
+        monkeypatch.undo()
+        try:
+            send_up(proxy, gcs, heartbeat())
+            _, proxy_fc_side = fc.recvfrom(65535)
+            fc.sendto(heartbeat(), proxy_fc_side)
+            gcs.recvfrom(65535)
+            assert proxy.stats().downlink_relayed == 1
+        finally:
+            proxy.stop()
+    assert proxy.error is None
+
+
+def test_downlink_from_non_fc_source_filtered_by_kernel(rig):
     proxy, gcs, fc = rig
     send_up(proxy, gcs, heartbeat())
     _, proxy_fc_side = fc.recvfrom(65535)
     with udp_socket() as intruder:
         intruder.sendto(heartbeat(), proxy_fc_side)
     assert_silent(gcs)
-    assert proxy.stats().downlink_ignored == 1
+    # The FC-side socket is connected to the FC, so the datagram never reaches
+    # the proxy at all (not even as "ignored").
+    assert proxy.stats().downlink_ignored == 0
     assert proxy.stats().downlink_relayed == 0
+
+
+def test_downlink_not_sent_to_unknown_peer():
+    raw = yaml.safe_load(POLICY_PATH.read_text(encoding="utf-8"))
+    raw["peers"] = [{"name": "gcs-primary", "allowed_ips": ["10.8.0.2/32"]}]
+    del raw["local_peer"]
+    with make_rig(parse_policy(raw)) as (proxy, gcs, fc):
+        send_up(proxy, gcs, heartbeat())
+        assert_silent(fc)
+        fc.sendto(heartbeat(), proxy._fc_sock.getsockname())
+        assert_silent(gcs)
+        stats = proxy.stats()
+    assert stats.downlink_relayed == 0
+    assert stats.downlink_ignored == 1
+
+
+def test_downlink_counted_as_send_failed_when_no_gcs_send_succeeds(rig):
+    proxy, gcs, fc = rig
+    send_up(proxy, gcs, heartbeat())
+    _, proxy_fc_side = fc.recvfrom(65535)
+    # Wait until the proxy has finished handling the uplink, so it cannot
+    # re-add the real GCS address after the peer list is replaced below.
+    gcs_addr = gcs.getsockname()
+    wait_until(lambda: gcs_addr in proxy._gcs_peers)
+    # An IPv6 address cannot be sent to from the IPv4 GCS socket, so every
+    # send to the GCS fails.
+    with proxy._lock:
+        proxy._gcs_peers.clear()
+        proxy._gcs_peers[("::1", 9)] = None
+    fc.sendto(heartbeat(), proxy_fc_side)
+    assert_silent(gcs)
+    stats = proxy.stats()
+    assert stats.downlink_relayed == 0
+    assert stats.downlink_send_failed == 1
+    assert "send failed: 1" in stats.format()
+
+
+def test_start_closes_gcs_socket_when_fc_socket_creation_fails(monkeypatch):
+    created = []
+    real_socket = socket.socket
+
+    def fake_socket(*args, **kwargs):
+        if created:
+            raise OSError("address family not supported")
+        sock = real_socket(*args, **kwargs)
+        created.append(sock)
+        return sock
+
+    proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), ("127.0.0.1", 9))
+    monkeypatch.setattr(socket, "socket", fake_socket)
+    with pytest.raises(OSError, match="address family"):
+        proxy.start()
+    assert len(created) == 1
+    assert created[0].fileno() == -1  # closed
+
+
+@pytest.mark.parametrize("error", [ConnectionRefusedError, ConnectionResetError])
+@pytest.mark.parametrize("refusals, forwarded", [(1, True), (2, False)])
+def test_fc_send_retried_once_after_icmp_refusal(monkeypatch, refusals, forwarded, error):
+    # A connected UDP socket fails the send after an ICMP port-unreachable (FC
+    # not up yet): ConnectionRefusedError on Linux, ConnectionResetError
+    # (WSAECONNRESET) on Windows. Simulated here, since loopback does not
+    # report it the same way on every OS.
+    real_socket = socket.socket
+
+    class RefusingSocket(real_socket):
+        remaining = refusals
+
+        def send(self, data, *args):
+            if RefusingSocket.remaining:
+                RefusingSocket.remaining -= 1
+                raise error("connection refused")
+            return super().send(data, *args)
+
+    with udp_socket() as fc, udp_socket() as gcs:
+        proxy = Proxy(load_policy(POLICY_PATH), ("127.0.0.1", 0), fc.getsockname())
+        sockets = iter([real_socket, RefusingSocket])
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: next(sockets)(*a, **kw))
+        proxy.start()
+        monkeypatch.undo()
+        try:
+            frame = heartbeat()
+            send_up(proxy, gcs, frame)
+            if forwarded:
+                data, _ = fc.recvfrom(65535)
+                assert data == frame
+                wait_until(lambda: proxy.stats().forwarded == {HEARTBEAT_ID: 1})
+                assert proxy.stats().dropped == {}
+            else:
+                wait_until(lambda: proxy.stats().dropped == {(HEARTBEAT_ID, "send error"): 1})
+                assert_silent(fc)
+                assert proxy.stats().forwarded == {}
+        finally:
+            proxy.stop()
+    assert proxy.error is None
 
 
 def test_allowed_frame_counted_for_local_peer(rig):
