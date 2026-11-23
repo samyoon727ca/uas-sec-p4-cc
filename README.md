@@ -79,6 +79,17 @@ dropped with reason `rate_limited`. So over `t` seconds at most `rate * t + burs
 frames of one type from one peer reach the FC. Only frames the allowlist accepted
 use a bucket.
 
+**Known limitation: commands share one bucket per message type.** The bucket key
+is the message type, not the `MAV_CMD` inside it, so every `COMMAND_LONG` from a
+peer draws on that peer's single `COMMAND_LONG` bucket (likewise `COMMAND_INT`).
+A peer that floods an allowed low-value command (for example
+`MAV_CMD_REQUEST_MESSAGE` above 5/s) empties the bucket, and its next
+`MAV_CMD_COMPONENT_ARM_DISARM` or `MAV_CMD_NAV_RETURN_TO_LAUNCH` is dropped as
+`rate_limited` until tokens refill. Only that peer's own commands are affected;
+other peers have their own buckets. Keying command buckets by
+`(peer, message type, command)` with per-command rates is open for the owner
+to decide.
+
 ## Running the proxy
 
 ```sh
