@@ -7,6 +7,11 @@ tokens/s up to ``burst``; a frame takes one token, and a frame that finds less
 than one token is over the limit. So over any interval of ``t`` seconds at
 most ``rate * t + burst`` frames of one type from one peer get through.
 
+The key does not include the ``MAV_CMD`` of a ``COMMAND_LONG`` / ``COMMAND_INT``,
+so all commands from one peer share that message type's bucket, and a flood of
+one allowed command can starve the peer's others (known limitation, see the
+README "Rate limits" section).
+
 Buckets are only created for frames the classifier already allowed, so their
 number is bounded by peers x allowed message types. Not thread-safe: the proxy
 calls it from its single loop thread.

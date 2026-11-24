@@ -17,7 +17,9 @@ test reads them from the loaded policy rather than hard-coding them.
   stop forwarded traffic from working.
 
 PARAM_REQUEST_READ is used because no other SITL test sends it, so its bucket
-for this peer starts full and the other tests' counters are not affected.
+for this peer starts full and the other tests' counters are not affected. The
+proxy is shared by the whole session, so the test checks that no
+PARAM_REQUEST_READ reached the proxy before the flood instead of assuming it.
 """
 
 import time
@@ -66,6 +68,11 @@ def test_flood_is_rate_limited_and_forwarded_requests_answered(via_proxy, proxy)
         return False  # keep collecting until the timeout
 
     fwd_before, lim_before, peer_lim_before = counts(proxy.stats(), peer.name)
+    assert fwd_before == 0 and lim_before == 0, (
+        f"PARAM_REQUEST_READ already seen by the session proxy ({fwd_before} forwarded, "
+        f"{lim_before} rate_limited), so its bucket may not start full; "
+        "the flood test must be the only SITL test sending it"
+    )
     via_proxy.drain()
 
     total = int(FLOOD_RATE * FLOOD_SECONDS)
