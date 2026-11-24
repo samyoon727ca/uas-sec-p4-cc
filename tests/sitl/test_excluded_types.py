@@ -309,6 +309,10 @@ class RadioStatus(Case):
                 out = self._listener(min(remaining, LISTENER_TIMEOUT))
                 listened = listened or bool(LISTENER_DONE.search(out))
                 # One instance per receiving link: the values may be in any of them.
+                # A topic keeps its latest sample across tests, so the match is not
+                # tied to this send by timestamp (PX4's boot-relative clock is not
+                # comparable with ours); a stale sample would have to carry the same
+                # two random uint16 values, a chance of about 2**-32 per test.
                 if any(all(f.search(block) for f in fields)
                        for block in out.split(b"\nInstance ")):
                     return True
