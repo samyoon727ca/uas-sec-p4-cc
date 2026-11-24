@@ -26,6 +26,11 @@ compare it with the frame the client sent.
 If no PX4 HEARTBEAT arrives on the GCS link, the SITL tests are skipped, so
 ``pytest`` works without PX4. Set ``CC_SITL_REQUIRED=1`` (CI does) to make that
 a failure instead, so a SITL that did not start cannot pass as skipped tests.
+
+The ``direct`` fixture also fails the session if PX4's HEARTBEAT on the GCS link
+is signed: a signing key left in the SITL working directory by an interrupted
+run (see ``test_signed_passthrough.py``) would otherwise make later tests fail
+in confusing ways.
 """
 
 from __future__ import annotations
@@ -62,6 +67,11 @@ REQUIRED = os.environ.get("CC_SITL_REQUIRED", "") not in ("", "0")
 HEARTBEAT_TIMEOUT = 120.0 if REQUIRED else 3.0
 PAIR_TIMEOUT = 15.0
 KEEPALIVE_PERIOD = 1.0  # well inside PX4's 3 s partner timeout
+
+
+def _is_signed(frame: bytes) -> bool:
+    """``frame`` is a MAVLink 2 frame with the signed incompat flag set."""
+    return len(frame) > 10 and frame[0] == 0xFD and bool(frame[2] & 0x01)
 
 
 def _unavailable(reason: str):
@@ -132,6 +142,13 @@ def direct():
         if not hb:
             _unavailable(f"no PX4 HEARTBEAT on UDP {GCS_LINK_REMOTE_PORT} "
                          f"within {HEARTBEAT_TIMEOUT:.0f}s")
+        if _is_signed(bytes(hb[0].get_msgbuf())):
+            pytest.fail(
+                "PX4 signs its frames on the direct link before any test installed a key: "
+                "a signing key from an earlier, interrupted run is probably still in the "
+                "SITL working directory (mavlink/mavlink-signing-key.bin). Restart PX4 "
+                "SITL with a fresh working directory.", pytrace=False,
+            )
         link.target_system = hb[0].get_srcSystem()
         yield link
     finally:

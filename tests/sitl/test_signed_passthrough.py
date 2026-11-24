@@ -31,7 +31,8 @@ and zero timestamp, accepted by PX4 only when signed with the current key) and
 turns client signing off again, so the session's other tests keep running
 unsigned. If a run is interrupted before that, the key stays in the SITL
 working directory (``mavlink/mavlink-signing-key.bin``); start the next run
-with a fresh one, as CI does.
+with a fresh one, as CI does. The ``direct`` fixture (conftest.py) fails the
+session with that advice if PX4's HEARTBEAT is already signed at the start.
 """
 
 from __future__ import annotations

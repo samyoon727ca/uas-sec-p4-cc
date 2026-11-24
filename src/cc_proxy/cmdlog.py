@@ -37,30 +37,15 @@ which the policy bounds, never by anything the sender controls. Forward lines
 are not capped (forwarded commands are already held to the SR-012 rate), so the
 cap never hides a forwarded command.
 
-Suppressed drops lose their per-attempt detail: they appear only in the
-``suppressed`` count, without ``src``, ``sysid``, ``compid``, ``command``,
-targets or ``reason``. This cuts both ways: anyone sending disallowed commands
-from inside a peer's AllowedIPs, or from any unknown IP (all share the ``null``
-peer), can use up that peer's budget and hide other drops' details for that
-second. The proxy counters (``dropped`` by msgid and reason, ``peer_dropped``
-by peer and reason) still hold the exact totals. The summary has no per-source
-or per-command breakdown because those values are chosen by the sender and,
-with all unknown IPs sharing one budget, such a map could grow without limit
-within one window.
-
-Each line is written after the frame was sent and flushed at once. A write
-error is not caught: it stops the proxy loop (``Proxy.error``), so at most the
-one command whose line failed is forwarded without a log entry. A write error
-in :meth:`CommandLog.close` (pending summaries, or the line that already failed
-still buffered) is logged and kept in ``CommandLog.error`` instead of raised:
-the proxy has stopped by then, and ``cc-proxy`` exits 1 when it is set. A
-failed summary does not stop the others from being attempted, and its peer and
-suppressed count go to the error log instead. A ``drop_suppressed`` line
-reported as lost in the error log may still end up in the file: the failed text
-can stay in the file object's write buffer, and a later flush (the next summary
-or the final close) may write it. No count is lost, but the two records can then
-disagree; read such an error-log entry as "not confirmed written", not
-"definitely absent".
+Suppressed drops lose their per-attempt detail (only the ``suppressed`` count
+remains; the proxy counters keep the exact totals). Each line is written after
+the frame was sent and flushed at once. A write error is not caught: it stops
+the proxy loop (``Proxy.error``). A write error in :meth:`CommandLog.close` is
+logged and kept in ``CommandLog.error`` instead of raised, and ``cc-proxy``
+exits 1 when it is set. The trade-offs and edge cases (who can use up a peer's
+drop budget, why the summary has no breakdown, the one-command gap on a write
+error, a summary reported lost that may still be flushed) are described once,
+in README.md, section "Command log (SR-013)".
 
 The log holds peer addresses and the full command history, so a new file is
 created with mode ``0o600`` (owner read/write only, :data:`FILE_MODE`; POSIX).
@@ -227,9 +212,9 @@ class CommandLog:
         Every pending summary is attempted and the file is closed even if a
         write fails. Each error is logged (with the peer's suppressed count if
         its summary could not be written), the first is stored in
-        :attr:`error`, and none is raised (see the module docstring). A
-        summary reported as not written may still reach the file through a
-        later flush (also described there).
+        :attr:`error`, and none is raised. A summary reported as not written
+        may still reach the file through a later flush (see README.md,
+        "Command log (SR-013)").
         """
         if self._file.closed:
             return

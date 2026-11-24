@@ -232,7 +232,8 @@ send the frame.
   counted as dropped. The key is removed again at the end (signed blank-key
   SETUP_SIGNING) so the other tests in the session run unsigned. An interrupted
   run can leave the key in the SITL working directory; start the next run with
-  a fresh one, as CI does.
+  a fresh one, as CI does. The session fails at the start, with that advice, if
+  PX4's HEARTBEAT on the direct link is already signed.
 - `test_excluded_types.py` covers the SR-011 exclusions other than FTP.
   Differential: SERIAL_CONTROL (MAVLink shell reply), SETUP_SIGNING (PX4 starts
   signing with the new key; removed again after each test) and ADSB_VEHICLE
