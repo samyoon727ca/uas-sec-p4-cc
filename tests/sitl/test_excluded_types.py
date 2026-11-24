@@ -22,6 +22,16 @@ SIH, the links of conftest.py) allows. The oracle type is stated per type in
   a transponder report and re-sends it in its own ADSB_VEHICLE stream on every
   link, with PX4 as the source system. That shows the report entered PX4's
   traffic pipeline, the input THR-050 is about.
+* RADIO_STATUS: a report with random ``rxerrors`` and ``fixed`` values. PX4
+  (``MavlinkReceiver::handle_message_radio_status``) publishes every received
+  RADIO_STATUS to the ``radio_status`` uORB topic, one instance per receiving
+  link. It only throttles its streams on a link started with software
+  throttling (``mavlink start -s``), which none of the SITL links is, and has no
+  RADIO_STATUS stream that would echo it. The publication is read with
+  ``listener radio_status`` over a MAVLink shell on the direct link, whichever
+  link the frame was sent on (SERIAL_CONTROL does not pass the proxy), so its
+  control reaction is seen there and not through the proxy; the shell is
+  closed again after each read.
 
 For each: the direct baseline (GCS link, no proxy) shows the reaction; via the
 proxy there is none within the same window, the proxy counts exactly one SR-011
@@ -32,17 +42,14 @@ test).
 
 **Egress-only** (no reaction PX4 SITL can show):
 
-* RADIO_STATUS: PX4 records it and only throttles its streams on a link started
-  with software throttling (``mavlink start -s``); none of the SITL links is.
-  PX4 has no RADIO_STATUS stream that would echo it.
 * COLLISION: PX4 v1.18.0-rc2 has no receive handler for it.
 
-For these only the proxy's egress is checked: the frame is counted as one SR-011
+For this only the proxy's egress is checked: the frame is counted as one SR-011
 drop and is not among the frames the proxy sent to PX4 (``forward_tap``). An
 allowlisted PING sent right after it is in the tap, which shows the tap sees
 the proxy's egress; the proxy handles uplink datagrams in order on one thread,
 so by then the excluded frame has been handled too. Nothing here shows what
-PX4 would do with these frames.
+PX4 would do with it.
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import re
 import socket
 import time
 from collections.abc import Callable
@@ -74,6 +82,11 @@ CLEANUP_LINK_ID = 21  # signing link ID for the key removal (distinct signing st
 
 SHELL_LINE = b"ver git\n"
 SERIAL_CONTROL_DATA_LEN = 70
+SHELL_PROMPT = b"pxh> "  # PX4 POSIX shell (pxh), printed when a command has finished
+
+LISTENER_LINE = b"listener radio_status\n"
+LISTENER_DONE = re.compile(rb"TOPIC: radio_status|never published")
+LISTENER_TIMEOUT = 1.5  # wait for one listener's output
 
 
 def msgid(frame: bytes) -> int:
@@ -99,6 +112,12 @@ def signed_with(buf: bytes, key: bytes) -> bool:
     buf = bytes(buf)
     return (is_signed(buf) and len(buf) == 10 + buf[1] + 2 + 13
             and hashlib.sha256(key + buf[:-6]).digest()[:6] == buf[-6:])
+
+
+def is_shell_reply(link, msg) -> bool:
+    return (msg.get_type() == "SERIAL_CONTROL" and from_autopilot(link, msg)
+            and bool(msg.flags & mav2.SERIAL_CONTROL_FLAG_REPLY)
+            and msg.device == mav2.SERIAL_CONTROL_DEV_SHELL)
 
 
 def wait_frame(link, check, timeout: float = REPLY_TIMEOUT) -> bool:
@@ -174,12 +193,7 @@ class SerialControl(Case):
         return self._shell(flags, SHELL_LINE)
 
     def reacted(self, link, token, timeout: float) -> bool:
-        def is_shell_reply(m) -> bool:
-            return (m.get_type() == "SERIAL_CONTROL" and from_autopilot(link, m)
-                    and bool(m.flags & mav2.SERIAL_CONTROL_FLAG_REPLY)
-                    and m.device == mav2.SERIAL_CONTROL_DEV_SHELL)
-
-        return bool(link.collect(is_shell_reply, timeout))
+        return bool(link.collect(lambda m: is_shell_reply(link, m), timeout))
 
     def cleanup(self, route: Route, direct, via_proxy, token) -> None:
         # No RESPOND flag: PX4 closes the shell of the link it arrives on.
@@ -251,11 +265,61 @@ class AdsbVehicle(Case):
 
 class RadioStatus(Case):
     name = "RADIO_STATUS"
-    oracle = EGRESS_ONLY
+    oracle = DIFFERENTIAL
+
+    def token(self) -> tuple[int, int]:
+        return random.randrange(1, 0x10000), random.randrange(1, 0x10000)  # rxerrors, fix
 
     def message(self, link, token):
+        rxerrors, fixed = token
         # txbuf 0: the "radio buffer nearly full" report THR-051 is about.
-        return mav2.MAVLink_radio_status_message(0, 0, 0, 0, 0, 0, 0)
+        return mav2.MAVLink_radio_status_message(0, 0, 0, 0, 0, rxerrors, fixed)
+
+    def prepare(self, direct, via_proxy) -> None:
+        # The reaction is read over a MAVLink shell on the direct link, whatever
+        # link the frame was sent on: SERIAL_CONTROL does not pass the proxy.
+        self._direct, self._via_proxy = direct, via_proxy
+
+    def _listener(self, timeout: float) -> bytes:
+        """Output of one ``listener radio_status`` on the direct link's shell."""
+        direct = self._direct
+        flags = mav2.SERIAL_CONTROL_FLAG_RESPOND | mav2.SERIAL_CONTROL_FLAG_EXCLUSIVE
+        direct.drain()
+        direct.conn.write(bytes(SerialControl._shell(flags, LISTENER_LINE).pack(direct.mav)))
+        out = bytearray()
+        deadline = time.monotonic() + timeout
+        while (remaining := deadline - time.monotonic()) > 0:
+            reply = direct.collect(lambda m: is_shell_reply(direct, m), remaining)
+            if not reply:
+                break
+            out += bytes(reply[0].data[:reply[0].count])
+            if out.endswith(SHELL_PROMPT) and LISTENER_DONE.search(out):
+                break
+        return bytes(out)
+
+    def reacted(self, link, token, timeout: float) -> bool:
+        rxerrors, fixed = token
+        fields = (re.compile(rb"\brxerrors: %d\s" % rxerrors), re.compile(rb"\bfix: %d\s" % fixed))
+        listened = False
+        deadline = time.monotonic() + timeout
+        try:
+            while (remaining := deadline - time.monotonic()) > 0:
+                # Keep the proxy PX4's partner on the offboard link (conftest.py).
+                self._via_proxy.heartbeat()
+                out = self._listener(min(remaining, LISTENER_TIMEOUT))
+                listened = listened or bool(LISTENER_DONE.search(out))
+                # One instance per receiving link: the values may be in any of them.
+                if any(all(f.search(block) for f in fields)
+                       for block in out.split(b"\nInstance ")):
+                    return True
+        finally:
+            # No RESPOND flag: PX4 closes the direct link's shell.
+            self._direct.conn.write(bytes(SerialControl._shell(0, b"").pack(self._direct.mav)))
+        assert listened, (
+            f"'listener radio_status' gave no output on the MAVLink shell within {timeout}s, "
+            f"so no RADIO_STATUS reaction could be seen"
+        )
+        return False
 
 
 class Collision(Case):

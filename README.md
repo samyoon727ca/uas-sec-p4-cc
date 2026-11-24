@@ -236,12 +236,13 @@ send the frame.
   PX4's HEARTBEAT on the direct link is already signed.
 - `test_excluded_types.py` covers the SR-011 exclusions other than FTP.
   Differential: SERIAL_CONTROL (MAVLink shell reply), SETUP_SIGNING (PX4 starts
-  signing with the new key; removed again after each test) and ADSB_VEHICLE
-  (PX4 re-sends the report in its own stream). Each has a direct baseline, a
-  proxied run with no reaction and one counted drop, and a control sent straight
-  to the offboard link past the proxy. Egress-only: RADIO_STATUS (PX4 throttles
-  only on links started with `-s`) and COLLISION (no receive handler in PX4
-  v1.18.0-rc2).
+  signing with the new key; removed again after each test), ADSB_VEHICLE
+  (PX4 re-sends the report in its own stream) and RADIO_STATUS (PX4 publishes
+  it to the `radio_status` uORB topic, read with `listener radio_status` over
+  the direct link's MAVLink shell). Each has a direct baseline, a proxied run
+  with no reaction and one counted drop, and a control sent straight to the
+  offboard link past the proxy. Egress-only: COLLISION (no receive handler in
+  PX4 v1.18.0-rc2).
 
 ```sh
 pytest -m sitl
